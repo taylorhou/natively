@@ -6,7 +6,7 @@ import os
 
 from natively import crypto, envelope
 
-from conftest import agent_key, http, inbox, make_node, outcomes, pump
+from conftest import agent_key, http, inbox, issue_grant, make_node, outcomes, pump, send_action, uses
 
 
 def test_safe_id_grammar():
@@ -73,27 +73,14 @@ def test_decrypted_group_id_never_becomes_a_path(tmp_path, hub, principal):
     assert "rejected-bad-id" in outcomes(n2, "group.recv")
 
 
-def _issue(node, agent, principal, max_uses=1, scope=None):
-    card = node.agents[agent]["card"]
-    scope = scope or [{"action": "test.ping", "resource": "host:any:ping", "params": {}}]
-    g = envelope.make_grant(principal.seed, "p", card, "ed25519:" + crypto.b64e(node.node_pub),
-                            scope, "ping", max_uses=max_uses)
-    gdir = os.path.join(node.home, "grants")
-    os.makedirs(gdir, exist_ok=True)
-    json.dump(g, open(os.path.join(gdir, g["grant_id"] + ".json"), "w"))
-    return g
-
-
 def _ping(n1, n2, grant_ids):
-    n1.queue_send("alpha", agent_key(n2, "beta"),
-                  {"kind": "action", "action": "test.ping", "resource": "host:any:ping", "params": {}, "text": "ping"},
-                  grant_ids=list(grant_ids))
+    send_action(n1, "alpha", n2, "beta", grant_ids)
 
 
 def test_grant_path_aliases_do_not_bypass_max_uses(tmp_path, hub, principal):
     n1 = make_node(tmp_path, "n1", hub.url, principal, {"alpha": ["msg.send"]})
     n2 = make_node(tmp_path, "n2", hub.url, principal, {"beta": ["test.ping"]})
-    g = _issue(n2, "beta", principal, max_uses=1)
+    g = issue_grant(n2, "beta", principal, max_uses=1)
     gid = g["grant_id"]
     _ping(n1, n2, [gid])
     pump([n1, n2], 3)
@@ -103,31 +90,31 @@ def test_grant_path_aliases_do_not_bypass_max_uses(tmp_path, hub, principal):
     pump([n1, n2], 3)
     assert outcomes(n2, "test.ping") == ["ok"]  # still exactly one execution
     assert outcomes(n2, "grant.check").count("rejected-bad-id") == 4
-    assert n2.state["grant_uses"] == {gid: 1}
+    assert uses(n2, gid) == 1
 
 
 def test_grant_file_must_carry_its_own_id(tmp_path, hub, principal):
     n1 = make_node(tmp_path, "n1", hub.url, principal, {"alpha": ["msg.send"]})
     n2 = make_node(tmp_path, "n2", hub.url, principal, {"beta": ["test.ping"]})
-    g = _issue(n2, "beta", principal, max_uses=5)
+    g = issue_grant(n2, "beta", principal, max_uses=5)
     alias = envelope.new_id("grt")
     gdir = os.path.join(n2.home, "grants")
     json.dump(g, open(os.path.join(gdir, alias + ".json"), "w"))  # a copy under another name
     _ping(n1, n2, [alias])
     pump([n1, n2], 3)
     assert outcomes(n2, "test.ping") == []
-    assert "invalid" in outcomes(n2, "grant.check")
-    assert n2.state["grant_uses"] == {}
+    assert "unknown-grant" in outcomes(n2, "grant.check")
+    assert uses(n2, g["grant_id"]) == 0 and uses(n2, alias) == 0
 
 
 def test_grant_listed_twice_executes_once(tmp_path, hub, principal):
     n1 = make_node(tmp_path, "n1", hub.url, principal, {"alpha": ["msg.send"]})
     n2 = make_node(tmp_path, "n2", hub.url, principal, {"beta": ["test.ping"]})
-    g = _issue(n2, "beta", principal, max_uses=5)
+    g = issue_grant(n2, "beta", principal, max_uses=5)
     _ping(n1, n2, [g["grant_id"], g["grant_id"]])
     pump([n1, n2], 3)
     assert outcomes(n2, "test.ping") == ["ok"]
-    assert n2.state["grant_uses"] == {g["grant_id"]: 1}
+    assert uses(n2, g["grant_id"]) == 1
 
 
 def test_hub_paths_are_checked(hub):

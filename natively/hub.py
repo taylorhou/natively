@@ -287,14 +287,13 @@ def make_server(port: int, state: State):
                 return "card agent_key does not match registered agent key"
             if card.get("node_key") != node_key:
                 return "card node_key is not the registering node"
-            try:
-                ref = _key_b64(card.get("principal_key_ref"))
-                if not ref or not envelope.verify_card(card):
-                    return "card not verified"
-            except Exception:
-                return "card not verified"
+            ref = _key_b64(card.get("principal_key_ref"))
             if st.principal_roots and ref not in st.principal_roots:
                 return "card principal not in this hub's root set"
+            # without a root set the hub trusts the principal the card
+            # names: it is a directory, and the nodes pin their own roots
+            if not ref or not envelope.verify_card(card, st.principal_roots or {ref}):
+                return "card not verified"
             return None
 
         # ---- routing helpers ----

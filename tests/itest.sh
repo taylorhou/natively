@@ -64,6 +64,7 @@ GID2=$(ls "$NVTEST"/n2/grants/ | sed 's/.json//')
 $NV --home "$NVTEST"/n1 send --from alpha --to beta@$FP2 --text "ping please" --action test.ping --resource host:any:ping --grants $GID2
 sleep 10
 echo "--- n2 ledger tail:"; $NV --home "$NVTEST"/n2 ledger tail -n 4
+grep -q '"action":"test.ping","params_hash":"[0-9a-f]*","outcome":"ok"' "$NVTEST"/n2/ledger.jsonl && echo "GRANTED PING OK" || { echo "GRANTED PING FAILED"; exit 1; }
 echo "--- ledger chains:"; $NV --home "$NVTEST"/n1 ledger verify; $NV --home "$NVTEST"/n2 ledger verify
 kill $HUB $N1 $N2 2>/dev/null
 echo "=== ITEST DONE ==="
