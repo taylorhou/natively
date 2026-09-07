@@ -16,6 +16,7 @@ import urllib.request
 import urllib.error
 from . import crypto, envelope, jcs
 from .ledger import Ledger
+from .revocation import Revocations, RevocationError, FeedUnavailable
 
 P = 5  # poll interval seconds (spec 4 sizing: ack_deadline 2P+jitter, retries 2P/4P/8P)
 
@@ -170,6 +171,7 @@ class Node:
         self.principal_pub = roots[0]
         self.principal_roots = set(roots)
         self._dir_cache = (0.0, None)
+        self.revocations = Revocations(self.home, self.principal_roots)
         self.ledger = Ledger(os.path.join(self.home, "ledger.jsonl"))
         self.state_path = os.path.join(self.home, "state.json")
         self.state = self._load_state()
@@ -860,12 +862,11 @@ class Node:
         if not envelope.safe_id(gid, "grt"):
             return None
         gpath = os.path.join(self.home, "grants", gid + ".json")
-        if not os.path.exists(gpath):
-            return None
         try:
-            g = json.load(open(gpath))
-        except ValueError:
-            return None
+            with open(gpath) as f:
+                g = json.load(f)
+        except (OSError, ValueError):
+            return None  # missing, unreadable or not JSON: not held; never an exception on the receive path
         if not isinstance(g, dict) or g.get("grant_id") != gid:
             return None
         return g
@@ -875,16 +876,26 @@ class Node:
         whose action is the executed one (never the grant.check rows), at
         or after `since` (epoch seconds) when given, under scope entry
         `scope` when given (an entry that recorded no scope counts for
-        every scope). Ledger timestamps are whole seconds, so a row is
-        taken as up to one second later than written: a use never leaves
-        a window early. The ledger is the one durable record of use, so
-        accounting survives a lost state file; its per-grant index makes
-        a check cost this grant's rows, not the lifetime ledger."""
+        every scope). An execution under a delegation of this grant
+        (a row whose `parent` is this id) spends this grant's budget too,
+        against the parent scope entry the row names. Ledger timestamps
+        are whole seconds, so a row is taken as up to one second later
+        than written: a use never leaves a window early. The ledger is
+        the one durable record of use, so accounting survives a lost
+        state file; its per-grant index (rows filed under the grant they
+        ran under and under the parent they spent) makes a check cost
+        this grant's rows, not the lifetime ledger."""
         n = 0
         for e in self.ledger.rows_for_grant(gid):
             if e.get("outcome") != "ok" or e.get("action") == "grant.check":
                 continue
-            if scope is not None and "scope" in e and e["scope"] != scope:
+            if e.get("grant_id") == gid:
+                if scope is not None and "scope" in e and e["scope"] != scope:
+                    continue
+            elif e.get("parent") == gid:
+                if scope is not None and "parent_scope" in e and e["parent_scope"] != scope:
+                    continue
+            else:
                 continue
             if since is not None:
                 try:
@@ -894,6 +905,40 @@ class Node:
                     pass  # a use whose age is unknown counts against every window: unknown never frees budget
             n += 1
         return n
+
+    def _subject_card(self, grant):
+        """The principal-signed card of a grant's subject: a local agent's
+        when the key is here, else the directory's copy verified under the
+        pinned roots. The card must be the one the grant names by hash and
+        key. Raises IdentityError when it cannot be resolved (the check
+        that needs it then fails closed)."""
+        subj = grant.get("subject") if isinstance(grant.get("subject"), dict) else {}
+        key = subj.get("key")
+        if not isinstance(key, str) or not isinstance(subj.get("agent"), str):
+            raise IdentityError("grant subject is malformed")
+        card = None
+        for a in self.agents.values():
+            if a["card"].get("agent_key") == key:
+                card = a["card"]
+                break
+        if card is None:
+            try:
+                card, _ = self._peer_card(key)
+            except IdentityError:
+                raise
+            except Exception as e:  # the hub unreachable, a malformed directory: not resolvable now
+                raise IdentityError("subject card not resolvable: %s" % e)
+        elif not envelope.verify_card(card, self.principal_roots):
+            # a local card is held to the same standard as one from the
+            # directory: principal-signed under the pinned roots and unexpired
+            raise IdentityError("subject card on file does not verify under the pinned roots")
+        if envelope.obj_hash(card) != subj["agent"]:
+            raise IdentityError("subject card on file is not the card the grant names")
+        return card
+
+    @staticmethod
+    def _in_window(g, now):
+        return envelope.parse_iso(g["not_before"]) <= now < envelope.parse_iso(g["expires_at"])
 
     def _apply_grants(self, env, agent_name, body):
         """Action path (spec 3, 4): the message asks for an action under the
@@ -944,11 +989,27 @@ class Node:
                                    "grant subject is not the receiving agent - information only",
                                    issuer_model=issuer_model)
                 continue
+            # a delegated grant is verified against the parent it names,
+            # which must be held here under its own id too
             try:
-                envelope.verify_grant(g, self.principal_roots, subject_card=card)
-            except envelope.GrantError as e:
+                parent = parent_card = None
+                if isinstance(g.get("parent_grant"), str):
+                    parent = self._load_grant(g["parent_grant"])
+                if parent is not None:
+                    envelope.check_grant_shape(parent)  # a malformed parent is refused before anything reads its fields
+                    parent_card = self._subject_card(parent)
+                envelope.verify_grant(g, self.principal_roots, subject_card=card, parent=parent,
+                                      parent_subject_card=parent_card)
+            except (envelope.GrantError, IdentityError) as e:
                 self.ledger.append("agent:%s" % agent_name, gid, "grant.check", {}, "invalid", str(e),
                                    issuer_model=issuer_model)
+                continue
+            except Exception as e:
+                # nothing a grant check raises may abort the message: the
+                # grant is refused with the reason, the next grant is tried,
+                # and the sender still gets its ack
+                self.ledger.append("agent:%s" % agent_name, gid, "grant.check", {}, "error",
+                                   "grant check failed: %s" % e, issuer_model=issuer_model)
                 continue
             # audience: the executing node or the receiving agent (spec 3),
             # in the prefixed or the bare key form
@@ -972,40 +1033,99 @@ class Node:
                                    {"action": action}, "out-of-scope", "refused",
                                    issuer_model=issuer_model)
                 continue
-            # the first covering entry with budget left is the one charged
-            # (by its own index, never a look-alike's); an entry whose
-            # window is spent does not hide a later entry that still covers
+            # the first covering entry that can run is the one charged, by
+            # its own index (never a look-alike's): budget left in its own
+            # window and, for a delegation, in the first parent entry it is
+            # a subset of that still has budget (a spent parent entry does
+            # not hide another that covers it); then the revocation check
+            # for that entry - a feed unreadable past grace refuses an
+            # entry without an offline allowance, and a later covering
+            # entry whose allowance covers the copy's age may still run
             chosen = None
+            why, why_outcome = "no covering entry with budget left", "exhausted"
             if "max_uses" in g:
                 uses, budget = self._grant_uses(gid), g["max_uses"]
-                if uses < budget:
-                    chosen = covering[0]
-                    left = "%d/%d" % (uses + 1, budget)
-                else:
+                candidates = list(covering) if uses < budget else []
+                left = "%d/%d" % (uses + 1, budget)
+                if not candidates:
                     why = "max_uses reached"
             else:
-                # a window belongs to its scope entry: uses under another
-                # entry of the same grant do not count against it
+                candidates = []
                 for scope_i, sc in covering:
                     w = sc["max_uses_per_window"]
                     uses, budget = self._grant_uses(gid, since=time.time() - w["window_s"], scope=scope_i), w["n"]
                     if uses < budget:
-                        chosen = (scope_i, sc)
-                        left = "%d/%d per %ds" % (uses + 1, budget, w["window_s"])
-                        break
-                    why = "%d uses in the last %ds" % (uses, w["window_s"])
+                        candidates.append((scope_i, sc))
+                    else:
+                        why = "%d uses in the last %ds" % (uses, w["window_s"])
+            for scope_i, sc in candidates:
+                if "max_uses" not in g:
+                    w = sc["max_uses_per_window"]
+                    left = "%d/%d per %ds" % (self._grant_uses(gid, since=time.time() - w["window_s"], scope=scope_i) + 1,
+                                              w["n"], w["window_s"])
+                # a delegation spends its parent's budget as well as its own,
+                # so two children cannot multiply what the principal granted once
+                parent_id = parent_i = None
+                if parent is not None:
+                    parent_id = parent["grant_id"]
+                    containing = [i for i, psc in enumerate(parent["scope"]) if envelope.scope_entry_within(sc, psc)]
+                    if not containing:
+                        why, why_outcome = "no parent scope entry covers the delegated entry", "invalid"
+                        continue
+                    for i in containing:
+                        if "max_uses" in parent:
+                            p_uses, p_budget = self._grant_uses(parent_id), parent["max_uses"]
+                            if p_uses < p_budget:
+                                parent_i = i
+                            else:
+                                why, why_outcome = "parent grant %s max_uses reached (%d/%d)" % (parent_id, p_uses, p_budget), "exhausted"
+                            break  # max_uses is the whole grant's budget: no entry has more
+                        pw = parent["scope"][i]["max_uses_per_window"]
+                        p_uses = self._grant_uses(parent_id, since=time.time() - pw["window_s"], scope=i)
+                        if p_uses < pw["n"]:
+                            parent_i = i
+                            break
+                        why, why_outcome = "parent grant %s: %d uses in the last %ds" % (parent_id, p_uses, pw["window_s"]), "exhausted"
+                    if parent_i is None:
+                        continue
+                # revocation before every action (spec 6): the local feed plus
+                # the feed the grant names, failing closed when unreadable
+                # under this entry's offline allowance
+                try:
+                    self.revocations.check(g, card, sc, parent=parent, parent_card=parent_card)
+                except FeedUnavailable as e:
+                    why, why_outcome = str(e), "revoked"
+                    continue  # another covering entry may carry an offline allowance
+                except RevocationError as e:
+                    why, why_outcome = str(e), "revoked"  # a revoked target, or an observation the disk refused: no entry runs
+                    break
+                except Exception as e:
+                    why, why_outcome = "revocation check failed: %s" % e, "error"
+                    break
+                chosen = (scope_i, sc, parent_id, parent_i)
+                break
             if chosen is None:
-                self.ledger.append("agent:%s" % agent_name, gid, "grant.check", {}, "exhausted", why,
+                self.ledger.append("agent:%s" % agent_name, gid, "grant.check", {}, why_outcome, why,
                                    issuer_model=issuer_model)
                 continue
-            scope_i, sc = chosen
+            scope_i, sc, parent_id, parent_i = chosen
+            # the revocation check may have waited on a feed: the validity
+            # windows are read again now, against the clock at execution
+            now = time.time()
+            if (not self._in_window(g, now) or not envelope.verify_card(card, self.principal_roots, now=now)
+                    or (parent is not None and not self._in_window(parent, now))
+                    or (parent_card is not None and not envelope.verify_card(parent_card, self.principal_roots, now=now))):
+                self.ledger.append("agent:%s" % agent_name, gid, "grant.check", {}, "invalid",
+                                   "grant, the receiving card, the parent or the parent's subject card left its validity window before execution",
+                                   issuer_model=issuer_model)
+                continue
             # the message's seen entry goes to disk before the action runs:
             # a crash between the two must not let the same msg_id, resent
             # with fresh ciphertext, execute again on the next start
             self._save_state()
             if action == "test.ping":
                 self.ledger.append("agent:%s" % agent_name, gid, "test.ping", params, "ok", "pong (%s)" % left,
-                                   scope=scope_i, issuer_model=issuer_model)
+                                   scope=scope_i, parent=parent_id, parent_scope=parent_i, issuer_model=issuer_model)
                 return "acted:test.ping"
             self.ledger.append("agent:%s" % agent_name, gid, action, params, "unsupported",
                                "no v0 executor for action %s" % action, issuer_model=issuer_model)

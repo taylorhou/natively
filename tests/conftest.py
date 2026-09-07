@@ -160,3 +160,9 @@ def send_action(n_from, agent_from, n_to, agent_to, grant_ids, action="test.ping
 
 def uses(node, gid):
     return node._grant_uses(gid)
+
+
+def mirror(node):
+    """The ledger's prose mirror (the reasons live there, not in the JSONL)."""
+    p = node.ledger.mirror_path
+    return open(p).read() if os.path.exists(p) else ""
