@@ -206,8 +206,13 @@ def make_server(port: int, state: State):
                     return self._json(404, {"error": "unknown recipient"})
                 with st.cond:
                     for fp in targets:
+                        # dedupe: a node re-POSTs unacked envelopes, so the
+                        # same msg_id must never enqueue twice for one node
+                        q = st.queues.setdefault(fp, [])
+                        if any(m.get("env", {}).get("msg_id") == env.get("msg_id") for m in q):
+                            continue
                         st.seq[fp] = st.seq.get(fp, 0) + 1
-                        st.queues.setdefault(fp, []).append(
+                        q.append(
                             {"env": env, "_seq": st.seq[fp], "_queued_for": fp})
                         if len(st.queues[fp]) > 5000:
                             st.queues[fp] = st.queues[fp][-5000:]

@@ -505,6 +505,13 @@ class Node:
             fcntl.flock(self._lockfd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
             raise SystemExit("another natively node process holds %s - refusing to run" % self.home)
+        # Hub switch: last_seq is hub-scoped. A different hub restarts its
+        # sequence at 1, so a stale cursor would silently skip the whole
+        # queue. Reset on hub change; unacked envelopes survive and re-send.
+        if self.state.get("hub_url") != self.hub:
+            self.state["hub_url"] = self.hub
+            self.state["last_seq"] = 0
+            self._save_state()
         self.publish_prekeys()
         self.register()
         self.ledger.append("node:%s" % self.name, None, "node.start",
