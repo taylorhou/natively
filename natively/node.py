@@ -554,6 +554,7 @@ class Node:
             # restarted on stale state heals without operator action (#14)
             if set(self.agents) != last_registered or time.time() - last_reg_time > 300:
                 try:
+                    self.publish_prekeys()  # hub may have lost them on a stale-state reboot
                     self.register()
                     last_registered = set(self.agents)
                     last_reg_time = time.time()
