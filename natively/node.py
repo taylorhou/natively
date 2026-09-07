@@ -582,12 +582,22 @@ class Node:
                             body_preview = self._dec_pairwise(sender_fp, env["body"])
                         except Exception:
                             body_preview = None
-                        if body_preview and body_preview.get("kind") == "ack":
-                            self._handle_ack(env, body_preview)
-                        else:
-                            self._handle_envelope(env)
+                        try:
+                            if body_preview and body_preview.get("kind") == "ack":
+                                self._handle_ack(env, body_preview)
+                            else:
+                                self._handle_envelope(env)
+                        except Exception as e:
+                            # per-envelope boundary (#16): one poison message
+                            # must never kill the loop or block the queue
+                            self.ledger.append("node:%s" % self.name, None, "msg.recv",
+                                               {"msg_id": mid}, "error", "handle failed: %s" % e)
                     else:
-                        self._handle_envelope(env)
+                        try:
+                            self._handle_envelope(env)
+                        except Exception as e:
+                            self.ledger.append("node:%s" % self.name, None, "msg.recv",
+                                               {"msg_id": mid}, "error", "handle failed: %s" % e)
                     self.state["last_seq"] = max(self.state["last_seq"], seq)
                 self._save_state()
             except (urllib.error.URLError, OSError) as e:

@@ -274,17 +274,30 @@ class SenderKey:
         n, self.n = self.n, self.n + 1
         return n, ct
 
+    # beyond MAX_SKIP the skipped-key store would grow unboundedly; beyond
+    # MAX_FFWD the gap is adversarial and refused. Between them the relay's
+    # lossy reality applies: a hub that dropped deep backlog (retention cap)
+    # makes the gap unrecoverable, so fast-forward WITHOUT storing keys -
+    # those messages are gone either way, and the stream must heal instead of
+    # poisoning every later message from this sender (break #16).
+    MAX_FFWD = 100000
+
     def decrypt_at(self, n: int, ct: bytes, aad: bytes = b""):
         if n in self.skipped:
             return aead_decrypt(self.skipped.pop(n), ct, aad)
         if n < self.n:
             raise CryptoError("replayed/old sender-key message")
+        if n - self.n > self.MAX_FFWD:
+            raise CryptoError("sender-key gap beyond fast-forward bound")
         if n - self.n > self.MAX_SKIP:
-            raise CryptoError("sender-key skip window exceeded")
-        while self.n < n:
-            self.chain_key, mk = kdf_chain(self.chain_key)
-            self.skipped[self.n] = mk
-            self.n += 1
+            while self.n < n:  # lossy fast-forward, no skipped-key storage
+                self.chain_key, _ = kdf_chain(self.chain_key)
+                self.n += 1
+        else:
+            while self.n < n:
+                self.chain_key, mk = kdf_chain(self.chain_key)
+                self.skipped[self.n] = mk
+                self.n += 1
         self.chain_key, mk = kdf_chain(self.chain_key)
         self.n += 1
         return aead_decrypt(mk, ct, aad)
