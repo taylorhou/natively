@@ -176,6 +176,8 @@ def cmd_inbox(args):
 def cmd_fetch_blob(args):
     """Fetch + decrypt a blob referenced in an inbox record."""
     n = nodemod.Node(_home(args))
+    if not envelope.safe_id(args.msg_id, "msg"):
+        raise SystemExit("not a message id: %s" % args.msg_id)
     rec = json.load(open(os.path.join(n.home, "inbox", args.agent, args.msg_id + ".json")))
     b = rec["body"]
     import urllib.request, hashlib

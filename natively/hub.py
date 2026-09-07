@@ -119,7 +119,9 @@ class State:
     SAVE_INTERVAL = 2.0
 
     def _blob_path(self, bid):
-        return os.path.join(self.blob_dir, bid) if self.blob_dir else None
+        if not self.blob_dir or not envelope.safe_fp(bid):
+            return None
+        return os.path.join(self.blob_dir, bid)
 
     def blob_put(self, bid, data):
         p = self._blob_path(bid)
@@ -273,16 +275,22 @@ def make_server(port: int, state: State):
                     return self._json(200, {"agents": st.agent_dir, "nodes": st.nodes})
             if p.startswith("/v1/prekey/"):
                 fp = p.rsplit("/", 1)[1]
+                if not envelope.safe_fp(fp):
+                    return self._json(400, {"error": "bad node fingerprint"})
                 with st.lock:
                     b = st.prekeys.get(fp)
                 return self._json(200, b) if b else self._json(404, {"error": "no bundle"})
             if p.startswith("/v1/blob/"):
                 bid = p.rsplit("/", 1)[1]
+                if not envelope.safe_fp(bid):
+                    return self._json(400, {"error": "bad blob id"})
                 d = st.blob_take(bid)  # one-shot fetch; file store, no lock held
                 return self._raw(200, d) if d is not None else self._json(404, {"error": "no blob"})
             if p.startswith("/v1/poll/"):
                 rest = p[len("/v1/poll/"):]
                 fp, _, q = rest.partition("?")
+                if not envelope.safe_fp(fp):
+                    return self._json(400, {"error": "bad node fingerprint"})
                 after = 0
                 for kv in q.split("&"):
                     if kv.startswith("after="):
@@ -324,9 +332,11 @@ def make_server(port: int, state: State):
         def do_PUT(self):
             if self.path.startswith("/v1/prekey/"):
                 fp = self.path.rsplit("/", 1)[1]
-                b = self._body()
+                b = self._body()  # read the body before any refusal: the connection is keep-alive
                 if b is None:
                     return self._json(413, {"error": "too big"})
+                if not envelope.safe_fp(fp):
+                    return self._json(400, {"error": "bad node fingerprint"})
                 try:
                     bundle = json.loads(b)
                 except Exception:
