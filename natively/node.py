@@ -150,7 +150,9 @@ class Node:
     def _session_for_send(self, peer_fp):
         s = self._session("to", peer_fp)
         if s and s.send_chain is not None:
-            return s, None
+            # Re-attach the x3dh ephemeral until the peer's first ack proves
+            # it decrypted us - a lost first ciphertext must not brick the pair.
+            return s, (s.x3dh_ek if s.hs_pending else None)
         _, b = _http("GET", "%s/v1/prekey/%s" % (self.hub, peer_fp))
         bundle = json.loads(b)
         peer_spk_x = crypto.b64d(bundle["spk_x"])
@@ -159,6 +161,8 @@ class Node:
             raise ValueError("peer prekey sig invalid")
         root, ek = crypto.x3dh_initiator(self.node_seed, peer_spk_x)
         s = crypto.DRSession.init_initiator(root, peer_spk_x)
+        s.x3dh_ek = ek
+        s.hs_pending = True
         self.sessions["to:" + peer_fp] = s
         self._save_session("to", peer_fp)
         return s, ek  # ek travels with first ciphertext
@@ -453,6 +457,13 @@ class Node:
         if mid in self.state["unacked"]:
             self.state["unacked"].pop(mid)
             self._save_state()
+            peer_fp = self._resolve_node_by_key(env["from"].split(":", 1)[1])
+            if peer_fp:
+                s = self._session("to", peer_fp)
+                if s and s.hs_pending:
+                    s.hs_pending = False
+                    s.x3dh_ek = None
+                    self._save_session("to", peer_fp)
             self.ledger.append("node:%s" % self.name, None, "msg.ack",
                                {"msg_id": mid, "peer_head": body.get("ledger_head")}, "ok",
                                "acked %s" % mid)
@@ -518,6 +529,7 @@ class Node:
                            {"hub": self.hub, "fp": self.fp}, "ok",
                            "node %s (%s) online" % (self.name, self.fp))
         while True:
+            self._load_agents()  # hot-reload: agent-add must not need a daemon restart
             self._flush_outbox()
             try:
                 _, b = _http("GET", "%s/v1/poll/%s?after=%d" % (self.hub, self.fp, self.state["last_seq"]))

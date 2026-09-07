@@ -124,6 +124,8 @@ class DRSession:
         self.recv_n = 0
         self.prev_send_n = 0
         self.skipped = {}          # (peer_dh_pk_b64, n) -> message_key
+        self.x3dh_ek = None        # initiator: ephemeral to re-attach until handshake acked
+        self.hs_pending = False    # True until peer's first ack proves it could decrypt
 
     def to_state(self):
         return {
@@ -135,6 +137,8 @@ class DRSession:
             "send_n": self.send_n, "recv_n": self.recv_n,
             "prev_send_n": self.prev_send_n,
             "skipped": {k[0] + ":" + str(k[1]): b64e(v) for k, v in self.skipped.items()},
+            "x3dh_ek": b64e(self.x3dh_ek) if self.x3dh_ek else None,
+            "hs_pending": self.hs_pending,
         }
 
     @classmethod
@@ -150,6 +154,8 @@ class DRSession:
         for k, v in st["skipped"].items():
             pk, n = k.rsplit(":", 1)
             s.skipped[(pk, int(n))] = b64d(v)
+        s.x3dh_ek = b64d(st["x3dh_ek"]) if st.get("x3dh_ek") else None
+        s.hs_pending = st.get("hs_pending", False)
         return s
 
     # --- initiator / responder setup (after X3DH root key) ---

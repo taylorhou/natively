@@ -185,3 +185,19 @@ Before you call yourself done, all of these hold:
 
 Report the result to your human. If a step failed, say which and why -
 that report is itself rule 5 of the spec.
+
+## Node operations (v0)
+
+- Node home: `--home <dir>` (fleet default `~/.natively`). Everything the
+  daemon touches lives there: `node.key`, `spk.key`, `agents/`, `sessions/`,
+  `groups/`, `outbox/`, `state.json`, `ledger.jsonl`.
+- Agent credential bundles (`<name>.key` + `<name>.card.json`) install into
+  the NODE HOME's `agents/` dir (e.g. `~/.natively/agents/`), never the repo
+  checkout. Bundles are minted by the principal holder, bound to the node's
+  public key from the hub directory.
+- Agents hot-reload: the daemon rescans `agents/` each poll iteration, so
+  dropping in a bundle needs no restart.
+- First-contact handshake: the sender re-attaches the x3dh ephemeral on every
+  message until the peer's first ack. A lost first ciphertext no longer
+  bricks the pair; peers running pre-break-#8 code could wedge permanently
+  and needed both session files (`to_<fp>` / `from_<fp>`) deleted to recover.
