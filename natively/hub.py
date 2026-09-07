@@ -35,6 +35,10 @@ class State:
         self.queues = {}        # node_fp -> [envelope,...]
         self.seq = {}           # node_fp -> last seq
         self.blobs = {}         # blob_id -> bytes
+        self.blob_order = []    # fifo for eviction
+        self.blob_bytes = 0
+        self.qids = {}          # node_fp -> set(msg_id) for O(1) dedupe
+        self._last_save = 0.0
         self.cond = threading.Condition(self.lock)
         if path and os.path.exists(path):
             self._load()
@@ -49,12 +53,24 @@ class State:
             self.queues = d.get("queues", {})
             self.seq = d.get("seq", {})
             self.blobs = {k: bytes.fromhex(v) for k, v in d.get("blobs_hex", {}).items()}
+            self.blob_order = list(self.blobs)
+            self.blob_bytes = sum(len(v) for v in self.blobs.values())
+            for fp, q in self.queues.items():
+                self.qids[fp] = {m.get("env", {}).get("msg_id") for m in q}
         except Exception as e:
             print("hub: state load failed, starting empty:", e)
 
-    def save(self):
+    BLOB_CAP = 64 * 1024 * 1024
+    SAVE_INTERVAL = 2.0
+
+    def save(self, force=False):
         if not self.path:
             return
+        import time
+        now = time.time()
+        if not force and now - self._last_save < self.SAVE_INTERVAL:
+            return
+        self._last_save = now
         d = {"prekeys": self.prekeys, "nodes": self.nodes, "agent_dir": self.agent_dir,
              "agent_owner": self.agent_owner, "queues": self.queues, "seq": self.seq,
              "blobs_hex": {k: v.hex() for k, v in self.blobs.items()}}
@@ -208,14 +224,19 @@ def make_server(port: int, state: State):
                     for fp in targets:
                         # dedupe: a node re-POSTs unacked envelopes, so the
                         # same msg_id must never enqueue twice for one node
-                        q = st.queues.setdefault(fp, [])
-                        if any(m.get("env", {}).get("msg_id") == env.get("msg_id") for m in q):
+                        ids = st.qids.setdefault(fp, set())
+                        if env.get("msg_id") in ids:
                             continue
+                        q = st.queues.setdefault(fp, [])
                         st.seq[fp] = st.seq.get(fp, 0) + 1
                         q.append(
                             {"env": env, "_seq": st.seq[fp], "_queued_for": fp})
-                        if len(st.queues[fp]) > 5000:
-                            st.queues[fp] = st.queues[fp][-5000:]
+                        ids.add(env.get("msg_id"))
+                        if len(q) > 5000:
+                            drop = q[:-5000]
+                            st.queues[fp] = q[-5000:]
+                            for m in drop:
+                                ids.discard(m.get("env", {}).get("msg_id"))
                     st.save()
                     st.cond.notify_all()
                 return self._json(200, {"queued": len(targets)})
@@ -226,7 +247,13 @@ def make_server(port: int, state: State):
                 import hashlib
                 bid = hashlib.sha256(b).hexdigest()[:32]
                 with st.lock:
-                    st.blobs[bid] = b
+                    if bid not in st.blobs:
+                        st.blobs[bid] = b
+                        st.blob_order.append(bid)
+                        st.blob_bytes += len(b)
+                        while st.blob_bytes > st.BLOB_CAP and st.blob_order:
+                            old = st.blob_order.pop(0)
+                            st.blob_bytes -= len(st.blobs.pop(old, b""))
                     st.save()
                 return self._json(200, {"blob_id": bid, "size": len(b)})
             return self._json(404, {"error": "not found"})

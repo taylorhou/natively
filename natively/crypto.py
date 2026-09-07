@@ -290,8 +290,11 @@ class SenderKey:
         return aead_decrypt(mk, ct, aad)
 
     def state(self):
-        return {"ck": b64e(self.chain_key), "n": self.n}
+        return {"ck": b64e(self.chain_key), "n": self.n,
+                "skipped": {str(k): b64e(v) for k, v in self.skipped.items()}}
 
     @classmethod
     def from_state(cls, st):
-        return cls(b64d(st["ck"]), st["n"])
+        s = cls(b64d(st["ck"]), st["n"])
+        s.skipped = {int(k): b64d(v) for k, v in st.get("skipped", {}).items()}
+        return s
