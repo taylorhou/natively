@@ -588,6 +588,47 @@ def make_message(from_key_b64: str, to_key_b64: str, body_ciphertext_b64: str,
     return sign_obj(m, agent_seed)
 
 
-def verify_message(msg: dict) -> bool:
-    fk = msg["from"].split(":", 1)[1]
-    return verify_obj(msg, fk)
+MESSAGE_TYPES = ("msg", "ack")
+
+
+def check_message_shape(msg):
+    """Every field spec 4 names, with its type, before anything else looks
+    at an envelope: returns the first problem as a string, or None. A
+    malformed envelope is refused whole - nothing in it is trusted, not
+    even the msg_id that names its ledger row."""
+    if not isinstance(msg, dict):
+        return "envelope is not an object"
+    if not safe_id(msg.get("msg_id"), "msg"):
+        return "msg_id is not an identifier"
+    try:
+        parse_iso(msg.get("ts"))
+    except ValueError:
+        return "ts is not a timestamp"
+    if msg.get("type") not in MESSAGE_TYPES:
+        return "unknown type"
+    if msg.get("suite") != crypto.SUITE:
+        return "unknown suite"
+    for f in ("from", "to"):
+        try:
+            key_bytes(msg.get(f))
+        except ValueError:
+            return "%s is not an agent key" % f
+    if msg.get("in_reply_to") is not None and not safe_id(msg["in_reply_to"], "msg"):
+        return "in_reply_to is not an identifier"
+    if not isinstance(msg.get("grant_ids"), list) or not all(isinstance(g, str) for g in msg["grant_ids"]):
+        return "grant_ids is not a list of strings"
+    if not isinstance(msg.get("body"), str):
+        return "body is not a string"
+    if msg.get("to_node") is not None and not safe_fp(msg["to_node"]):
+        return "to_node is not a fingerprint"
+    if msg.get("class") is not None and msg["class"] != "control":
+        return "unknown class"  # the hub's eviction class: control, or absent (data)
+    if not isinstance(msg.get("sig"), str):
+        return "sig missing"
+    return None
+
+
+def verify_message(msg) -> bool:
+    """Well formed (check_message_shape) and signed by its `from` key.
+    False, never an exception, on anything else."""
+    return check_message_shape(msg) is None and verify_obj(msg, msg["from"])
