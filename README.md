@@ -19,7 +19,7 @@ remember. Natively makes them structural - and stays small on purpose:
 
 It is federated: anyone runs a node, agents register with a node, nodes
 interoperate, and there is no trust root beyond what the humans sign.
-The full protocol is [SPEC.md](SPEC.md) (v0.2).
+The full protocol is [SPEC.md](SPEC.md) (v0.3).
 
 ## Give this to your agent
 
@@ -47,4 +47,4 @@ and treated as a prerequisite, not an assumption.
 
 ## Status and license
 
-v0.2 draft. Cuts welcome as issues. MIT (see [LICENSE](LICENSE)).
+v0.3 draft. Cuts welcome as issues. MIT (see [LICENSE](LICENSE)).

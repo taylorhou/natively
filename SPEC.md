@@ -1,7 +1,14 @@
-# Natively Protocol Specification - v0.2 (draft)
+# Natively Protocol Specification - v0.3 (draft)
 
 Status: draft, transport-agnostic. The envelope, the message rules, and
 the ledger are the protocol; the transport underneath is an adapter.
+
+v0.3 delta (design review, 2026-09-07): concrete ack/retry sizing (section
+4), agent card field set and versioning (section 2), revocation as a
+signed per-principal feed with recovery keys (section 6), enrollment
+records for machine-rooted identity (section 8), and
+`max_uses_per_window` (section 3). The `standing_denial` proposal is
+tracked as issue #6 and not yet in the spec.
 
 ## 1. Principles
 
@@ -44,10 +51,26 @@ this one.
   equivalent plane (e.g. a Teale machine).
 - **Agent**: a process resident on a node. Holds an Ed25519 key,
   vouched for by its node. Acts only inside grants issued to it.
-- **Agent card**: the identity document. `{agent key, node key,
-  principal key ref, capabilities, ledger url}`. Cards are signed by
-  the principal. If the card is the only identity document v0 needs,
-  DIDs are out of scope for v1 as well.
+- **Agent card**: the identity document, signed by the principal:
+
+```json
+{"card_version": 1,
+ "agent_key": "ed25519:<b64>",
+ "node_key": "ed25519:<b64>",
+ "principal_key_ref": "ed25519:<b64>",
+ "capabilities": ["node.config.get", "test.ping"],
+ "ledger_url": "<url>",
+ "issued_at": "...", "expires_at": "...",
+ "supersedes": null,
+ "sig": "<principal signature>"}
+```
+
+  Card hash = SHA-256 over JCS(card minus `sig`); it is how grants name
+  their subject. `capabilities` are scope-grammar action strings, and
+  they bind: a grant whose scope names an action outside the subject
+  card's capabilities is invalid. Cards expire; `supersedes` chains a
+  replacement card to the one it replaces. If the card is the only
+  identity document the protocol needs, DIDs stay out of scope.
 
 Verification is against a pinned principal root, offline. There is no
 trust root beyond what the principals sign.
@@ -98,7 +121,11 @@ Field semantics:
   two are signed as one so the machine-readable part cannot drift from
   the human-readable one.
 - **max_uses** defaults to 1. One-shot grants stop a stale grant from
-  driving a second action later.
+  driving a second action later. For remediation shapes ("restart this
+  service up to 3 times per hour") a scope entry may instead carry
+  **max_uses_per_window** `{"n": 3, "window_s": 3600}`; the executor
+  counts uses per rolling window from the ledger. A grant carries one
+  or the other, never both, and never neither.
 - **offline_ok / max_offline_s** are per scope entry. Offline tolerance
   is only for scopes that read or report, never for scopes that change
   state.
@@ -127,7 +154,13 @@ Rules:
 - `msg_id` and `in_reply_to` live inside the envelope. Transport-level
   message ids and thread identity are never trusted.
 - Receipts are an explicit `ack` message type; delivery and read
-  receipts are protocol objects, not transport hopes.
+  receipts are protocol objects, not transport hopes. The ack is signed
+  by the recipient agent key and carries the recipient's ledger head
+  hash, so acks double as reconciliation beacons between ledgers.
+- Sizing over a poll transport with interval P: `ack_deadline` =
+  2P + jitter; retries at 2P, 4P, 8P. After the final miss the sender
+  ledgers the message `undelivered` and surfaces it to the principal -
+  a dead message is an event, never a silence.
 - Ordering comes from the ledger (`prev_hash`), never from arrival
   order at the transport.
 - Apply is idempotent, keyed on `msg_id`. Duplicates from the transport
@@ -153,8 +186,15 @@ Append-only JSONL, one line per action taken against a grant:
 
 ## 6. Revocation and failure
 
-- One signed message from a principal revokes an agent card and every
-  grant under it. Honored by all parties within a poll interval.
+- Revocation is a **per-principal signed append-only feed** of
+  tombstones, fetchable like the ledger. One tombstone revokes an agent
+  card and every grant under it; honored by all parties within a poll
+  interval.
+- Each principal's pinned root set includes a **recovery key**, held
+  apart from the day-to-day signing key. A compromised principal key
+  cannot revoke itself, so a tombstone against a compromised key is
+  signed by the recovery key. Without this, key compromise is
+  unrecoverable at the protocol level.
 - Lookup failure: fail closed after grace.
 - Executor exception: an action already in progress under a valid grant
   finishes its current atomic step and rolls back if that step fails.
@@ -194,6 +234,20 @@ is a spoofing machine the moment messages flow over it. Enrollment
 authentication is a prerequisite for any live message plane, and node
 software must treat it that way.
 
+### 8.1 Enrollment records
+
+- The host key is generated on the machine and **never exported**.
+- Enrollment is a record signed by the owning principal:
+  `{node_key, machine_fingerprint, residency_class, owner_ref,
+  expires_at, sig}`. `residency_class` is `bare` or `vm`, recorded
+  honestly - it attests residency class, nothing more (section 1.1).
+- The registry binds the transport session to the `node_key`;
+  heartbeats are signed over a registry-issued nonce, so a replayed
+  heartbeat proves nothing.
+- A fingerprint mismatch is a **new machine enrollment**, never a
+  re-key of an existing record. Machines do not migrate identities;
+  owners enroll replacements.
+
 ## 9. Deliberate omissions (v0)
 
 - DIDs (agent card + pinned principal root is enough).
@@ -205,7 +259,14 @@ software must treat it that way.
 
 ## 10. Open items
 
-- Ack + retry timer defaults over poll transports.
-- Agent-card field set and versioning.
-- Revocation-list distribution format (per-ledger today).
-- Enrollment protocol for machine-rooted node identity.
+- `standing_denial`: a principal-signed standing denial no future grant
+  may override, checked before scope, refusals ledgered. Design
+  questions open (expiry, precedence vs recovery tombstones,
+  granularity); tracked as issue #6.
+- The human-side signing client (CLI first, phone-friendly later).
+  Principal keys live where the humans are; until the signer exists,
+  unsigned cards are drafts.
+- Multi-principal co-sign.
+- Encryption at the protocol layer (round two; v0 rule: no secrets in
+  band).
+- First live plane and interop partners.
