@@ -120,7 +120,8 @@ def cmd_group_create(args):
         m = m.strip()
         if m:
             members.append({"agent_key": _resolve(n, m)})
-    gid = n.create_group(args.frm, members, name=args.name or "")
+    grant_ids = [g.strip() for g in (args.grants or "").split(",") if g.strip()]
+    gid = n.create_group(args.frm, members, name=args.name or "", grant_ids=grant_ids)
     print("group created:", gid)
 
 
@@ -371,7 +372,7 @@ def main(argv=None):
     p = sub.add_parser("directory"); p.set_defaults(f=cmd_directory)
     p = sub.add_parser("send"); p.add_argument("--from", dest="frm", required=True); p.add_argument("--to", required=True); p.add_argument("--text", required=True); p.add_argument("--action"); p.add_argument("--resource"); p.add_argument("--params"); p.add_argument("--grants"); p.set_defaults(f=cmd_send)
     p = sub.add_parser("blob"); p.add_argument("--from", dest="frm", required=True); p.add_argument("--to", required=True); p.add_argument("--file", required=True); p.set_defaults(f=cmd_blob)
-    p = sub.add_parser("group-create"); p.add_argument("--from", dest="frm", required=True); p.add_argument("--members", required=True); p.add_argument("--name"); p.set_defaults(f=cmd_group_create)
+    p = sub.add_parser("group-create"); p.add_argument("--from", dest="frm", required=True); p.add_argument("--members", required=True); p.add_argument("--name"); p.add_argument("--grants", help="comma-separated ids of the group.join grants the members hold on their nodes (each member uses the ones it holds)"); p.set_defaults(f=cmd_group_create)
     p = sub.add_parser("group-send"); p.add_argument("--from", dest="frm", required=True); p.add_argument("--gid", required=True); p.add_argument("--text", required=True); p.set_defaults(f=cmd_group_send)
     p = sub.add_parser("group-blob"); p.add_argument("--from", dest="frm", required=True); p.add_argument("--gid", required=True); p.add_argument("--file", required=True); p.set_defaults(f=cmd_group_blob)
     p = sub.add_parser("groups"); p.set_defaults(f=cmd_groups)
