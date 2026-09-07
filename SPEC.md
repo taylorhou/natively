@@ -1,4 +1,4 @@
-# Natively Protocol Specification - v0.3 (draft)
+# Natively Protocol Specification - v0.4 (draft)
 
 Status: draft, transport-agnostic. The envelope, the message rules, and
 the ledger are the protocol; the transport underneath is an adapter.
@@ -9,6 +9,12 @@ signed per-principal feed with recovery keys (section 6), enrollment
 records for machine-rooted identity (section 8), and
 `max_uses_per_window` (section 3). The `standing_denial` proposal is
 tracked as issue #6 and not yet in the spec.
+
+v0.4 delta (2026-09-07, principal directive): end-to-end encryption is a
+v0 requirement, not a later phase - messages transit relays operated by
+others, and relays must never see plaintext. Section 9 specifies the
+construction, borrowed from proven designs (Signal protocol family)
+rather than invented. Former sections 9 and 10 renumber to 10 and 11.
 
 ## 1. Principles
 
@@ -165,8 +171,9 @@ Rules:
   order at the transport.
 - Apply is idempotent, keyed on `msg_id`. Duplicates from the transport
   are expected and harmless.
-- Bodies are base64. Shell metacharacters in a body must never reach a
-  shell.
+- Bodies are base64 ciphertext under section 9. Shell metacharacters in
+  a body must never reach a shell - and at the transport layer a body is
+  opaque ciphertext anyway.
 
 ## 5. Ledger
 
@@ -248,16 +255,62 @@ software must treat it that way.
   re-key of an existing record. Machines do not migrate identities;
   owners enroll replacements.
 
-## 9. Deliberate omissions (v0)
+## 9. End-to-end encryption (v0 requirement)
+
+Messages transit relays and hubs operated by others. A relay routes and
+stores; it must never see plaintext. Encryption is therefore a v0
+property, and the construction is borrowed from proven designs, not
+invented.
+
+### 9.1 Construction (Signal protocol family)
+
+- **Pairwise sessions (1:1).** Signal construction: an X3DH-style key
+  agreement over the Ed25519 identity keys of section 2 (mapped to
+  X25519 for DH) plus ephemeral prekeys published by each node, followed
+  by a Double Ratchet - a symmetric KDF chain per direction plus a DH
+  ratchet on reply - giving per-message forward secrecy and break-in
+  recovery.
+- **Group sessions.** Sender Keys (the Signal group construction; the
+  same family as Matrix Megolm): each sender holds a per-group symmetric
+  ratchet and distributes its sender key to every member over the
+  pairwise channels of 9.1. Membership change rotates sender keys. A
+  group message is one ciphertext fan-out, not N pairwise sends.
+- **Principals are silent members.** Section 1 stands: the owning
+  principals' keys are recipients of every session their agents hold
+  (a pairwise session's principal, a group session's member principals).
+  Privacy is from third parties - relays included - never from
+  principals.
+- **Attachments and blobs.** Per-blob random AEAD key; the ciphertext is
+  stored at the transport, and the key plus the plaintext content hash
+  travel inside the encrypted envelope (the Signal attachment pattern).
+  Size lives at the transport; content lives with the endpoints.
+- **Suite agility.** The envelope carries `suite`. v0 suite `nv1`:
+  X25519 X3DH + Double Ratchet, HKDF-SHA-256 chains, XSalsa20-Poly1305
+  AEAD (libsodium), Sender Keys for groups. MLS (RFC 9420) is the named
+  interop target when a second independent implementation appears; suite
+  ids make that a negotiation, not a flag day.
+
+### 9.2 What this does not change
+
+- Relay verification (section 8) operates on envelope structure and
+  signatures - headers, cards, and grants are signed cleartext JSON.
+  Only `body` is ciphertext. No structural conflict.
+- The ledger already stores content hashes, not content (section 5);
+  prose mirror lines are written by the endpoints that hold plaintext.
+- What relays still see: routing metadata (from, to, ts, size).
+  Traffic-analysis resistance is out of scope for v0.
+- The no-secrets-in-band rule stands. Encryption is not a secrets
+  channel; it changes who can read an accident, not what may be sent.
+
+## 10. Deliberate omissions (v0)
 
 - DIDs (agent card + pinned principal root is enough).
-- Encryption at the protocol layer (privacy from the transport is a
-  round-two property; the v0 rule is no secrets in band at all).
 - Multi-principal co-sign.
+- Traffic-analysis resistance (relay-visible metadata stays).
 - Privacy from principals. Explicitly rejected: the property is
   private-to-third-parties, readable-by-principals.
 
-## 10. Open items
+## 11. Open items
 
 - `standing_denial`: a principal-signed standing denial no future grant
   may override, checked before scope, refusals ledgered. Design
@@ -267,6 +320,5 @@ software must treat it that way.
   Principal keys live where the humans are; until the signer exists,
   unsigned cards are drafts.
 - Multi-principal co-sign.
-- Encryption at the protocol layer (round two; v0 rule: no secrets in
-  band).
+- Prekey upload/rotation policy (bundle size, re-upload cadence).
 - First live plane and interop partners.
