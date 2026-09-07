@@ -5,7 +5,7 @@ import os
 import sys
 import time
 
-from . import crypto, envelope, jcs
+from . import crypto, envelope, jcs, revocation
 from . import node as nodemod
 from . import hub as hubmod
 
@@ -201,21 +201,82 @@ def cmd_ledger(args):
             print(json.dumps(e))
 
 
+def _write_grant(n, g):
+    gdir = os.path.join(n.home, "grants")
+    os.makedirs(gdir, exist_ok=True)
+    json.dump(g, open(os.path.join(gdir, g["grant_id"] + ".json"), "w"), indent=2)
+
+
+def _check_feed(n, url):
+    """A feed no execution could read is refused at issuance, not at every
+    action: the url must be a scheme this node reads, and the feed must
+    be fetchable now and hold only tombstones that verify under this
+    node's roots (an empty feed is fine). What it holds is kept in the
+    node's revocation state, so a tombstone seen at issuance still counts
+    if the feed is later truncated."""
+    try:
+        n.revocations.observe(url)
+    except revocation.RevocationError as e:
+        raise SystemExit("%s: %s" % (e, url))
+
+
 def cmd_grant_issue(args):
     n = nodemod.Node(_home(args))
     pseed = _principal_seed(args.principal)
     card = json.load(open(os.path.join(n.home, "agents", args.agent + ".card.json")))
     scope = json.loads(open(args.scope).read()) if os.path.exists(args.scope) else json.loads(args.scope)
+    if args.revocation_ledger:
+        _check_feed(n, args.revocation_ledger)
     try:
         g = envelope.make_grant(pseed, args.principal_name, card,
                                 "ed25519:" + crypto.b64e(n.node_pub), scope, args.statement,
-                                max_uses=args.max_uses, ttl_s=args.ttl)
-    except ValueError as e:
+                                max_uses=None if args.windowed else args.max_uses, ttl_s=args.ttl,
+                                revocation_ledger=args.revocation_ledger or "")
+        # refuse to write what the node would refuse: the same pinned root set the node executes under
+        envelope.verify_grant(g, n.principal_roots, subject_card=card)
+    except (ValueError, envelope.GrantError) as e:
         raise SystemExit("grant not signed: %s" % e)
-    gdir = os.path.join(n.home, "grants")
-    os.makedirs(gdir, exist_ok=True)
-    json.dump(g, open(os.path.join(gdir, g["grant_id"] + ".json"), "w"), indent=2)
+    _write_grant(n, g)
     print("grant issued:", g["grant_id"])
+
+
+def cmd_grant_delegate(args):
+    """A local agent delegates a subset of a grant it holds (the parent,
+    whose subject it is) to another local agent. Depth one."""
+    n = nodemod.Node(_home(args))
+    parent = n._load_grant(args.parent)
+    if parent is None:
+        raise SystemExit("parent grant %s not held here" % args.parent)
+    seed = n.agents[args.frm]["seed"]
+    card = json.load(open(os.path.join(n.home, "agents", args.to + ".card.json")))
+    scope = json.loads(open(args.scope).read()) if os.path.exists(args.scope) else json.loads(args.scope)
+    if parent["revocation"]["ledger"]:
+        _check_feed(n, parent["revocation"]["ledger"])  # the child inherits the feed: it must still be readable
+    g = envelope.make_delegated_grant(seed, parent, card, scope, args.statement,
+                                      max_uses=None if args.windowed else args.max_uses, ttl_s=args.ttl)
+    envelope.verify_grant(g, n.principal_roots, subject_card=card, parent=parent,
+                          parent_subject_card=n._subject_card(parent))
+    _write_grant(n, g)
+    print("delegated grant issued:", g["grant_id"])
+
+
+def cmd_revoke(args):
+    """Append a tombstone to this node's local revocation feed. The target
+    is a grant id, an agent card hash, an agent key or a principal key;
+    the signer must be one of the node's pinned roots."""
+    from . import revocation
+    n = nodemod.Node(_home(args))
+    t = revocation.make_tombstone(_principal_seed(args.principal), args.target, args.reason or "")
+    if not revocation.verify_tombstone(t, n.principal_roots):
+        raise SystemExit("signer is not one of this node's pinned roots")
+    with open(n.revocations.local_path, "a") as f:
+        f.write(json.dumps(t, separators=(",", ":")) + "\n")
+    # the target goes into the shared observation store before this
+    # reports success: a local feed later truncated or deleted un-revokes
+    # nothing, and a daemon on this home sees it at its next check
+    if args.target not in n.revocations.local_targets():
+        raise SystemExit("tombstone written but not observed: %s" % args.target)
+    print("revoked:", args.target)
 
 
 def cmd_bot(args):
@@ -317,7 +378,9 @@ def main(argv=None):
     p = sub.add_parser("inbox"); p.add_argument("--agent", required=True); p.add_argument("--tail", type=int); p.set_defaults(f=cmd_inbox)
     p = sub.add_parser("fetch-blob"); p.add_argument("--agent", required=True); p.add_argument("--msg-id", required=True); p.add_argument("--out", required=True); p.set_defaults(f=cmd_fetch_blob)
     p = sub.add_parser("ledger"); p.add_argument("ledger_cmd", choices=["head", "verify", "tail"]); p.add_argument("-n", type=int, default=10); p.set_defaults(f=cmd_ledger)
-    p = sub.add_parser("grant-issue"); p.add_argument("--agent", required=True); p.add_argument("--principal", required=True); p.add_argument("--principal-name", default="principal"); p.add_argument("--scope", required=True); p.add_argument("--statement", required=True); p.add_argument("--max-uses", type=int, default=1); p.add_argument("--ttl", type=int, default=86400); p.set_defaults(f=cmd_grant_issue)
+    p = sub.add_parser("grant-delegate"); p.add_argument("--from", dest="frm", required=True, help="local agent holding the parent grant"); p.add_argument("--to", required=True, help="local agent receiving the delegation"); p.add_argument("--parent", required=True); p.add_argument("--scope", required=True); p.add_argument("--statement", required=True); p.add_argument("--max-uses", type=int, default=1); p.add_argument("--windowed", action="store_true", help="the scope entries carry max_uses_per_window; the grant carries no max_uses"); p.add_argument("--ttl", type=int, default=86400); p.set_defaults(f=cmd_grant_delegate)
+    p = sub.add_parser("revoke"); p.add_argument("--principal", required=True); p.add_argument("--target", required=True); p.add_argument("--reason"); p.set_defaults(f=cmd_revoke)
+    p = sub.add_parser("grant-issue"); p.add_argument("--agent", required=True); p.add_argument("--principal", required=True); p.add_argument("--principal-name", default="principal"); p.add_argument("--scope", required=True); p.add_argument("--statement", required=True); p.add_argument("--max-uses", type=int, default=1); p.add_argument("--windowed", action="store_true", help="the scope entries carry max_uses_per_window; the grant carries no max_uses"); p.add_argument("--ttl", type=int, default=86400); p.add_argument("--revocation-ledger", help="feed URL (file:// or https://) of the principal's tombstones; the node's local feed is always consulted"); p.set_defaults(f=cmd_grant_issue)
     p = sub.add_parser("bot"); p.add_argument("--agent", required=True); p.add_argument("--peers", default=""); p.add_argument("--blob-rate", type=float, default=0.05); p.add_argument("--min-gap", type=float, default=0.2); p.add_argument("--max-gap", type=float, default=2.0); p.add_argument("--peer-prob", type=float, default=0.7); p.add_argument("--group-prob", type=float, default=0.3); p.add_argument("--group-skip", default=""); p.set_defaults(f=cmd_bot)
 
     args = ap.parse_args(argv)

@@ -42,8 +42,10 @@ class Ledger:
                     continue
                 e = json.loads(line)
                 h = e["prev_hash_chain"]
-                if isinstance(e.get("grant_id"), str):  # a row naming no grant, or a malformed one, is chained but not indexed
-                    idx.setdefault(e["grant_id"], []).append(e)
+                gid, parent = e.get("grant_id"), e.get("parent")
+                for k in ((gid,) if gid == parent else (gid, parent)):
+                    if isinstance(k, str):  # a row naming no grant, or a malformed one, is chained but not indexed
+                        idx.setdefault(k, []).append(e)
         self._head_cache, self._head_stat, self._by_grant = h, key, idx
 
     def head(self) -> str:
@@ -51,27 +53,33 @@ class Ledger:
         return self._head_cache
 
     def rows_for_grant(self, grant_id) -> list:
-        """Every entry ledgered under `grant_id`, in chain order."""
+        """Every entry ledgered under `grant_id` - as the grant it ran under
+        or as the parent whose budget it spent - in chain order."""
         self._sync()
         return list(self._by_grant.get(grant_id, ()))
 
     def append(self, actor: str, grant_id, action: str, params, outcome: str,
-               prose: str, scope=None, issuer_model=None) -> dict:
+               prose: str, scope=None, issuer_model=None, parent=None, parent_scope=None) -> dict:
         """One entry. `scope` (an integer, the index of the grant scope
         entry an execution ran under) is recorded when given so per-scope
-        budgets can be counted back from the chain; `issuer_model`
-        (receiver-principal / sender-principal, spec 3) likewise on
-        grant-scoped rows. `grant_id` is a string
-        or None, checked before anything is written: a row that cannot be
-        indexed must never reach the file. Appends are serialized across
-        the processes writing one ledger (an flock beside the file): the
-        head is read, the row written and the file's new stat taken under
-        the lock, so two writers never chain onto the same head and the
-        index never adopts a stat that covers a row it did not see."""
-        if grant_id is not None and not isinstance(grant_id, str):
-            raise TypeError("grant_id must be a string or None")
-        if scope is not None and (isinstance(scope, bool) or not isinstance(scope, int)):
-            raise TypeError("scope must be an integer or None")
+        budgets can be counted back from the chain; `parent` and
+        `parent_scope` name the parent grant and its scope entry when the
+        execution ran under a delegation, so the parent's budget is
+        counted back from the chain too; `issuer_model` (receiver-principal
+        / sender-principal, spec 3) likewise on grant-scoped rows.
+        `grant_id` and `parent` are strings or None, checked before
+        anything is written: a row that cannot be indexed must never
+        reach the file. Appends are serialized across the processes
+        writing one ledger (an flock beside the file): the head is read,
+        the row written and the file's new stat taken under the lock, so
+        two writers never chain onto the same head and the index never
+        adopts a stat that covers a row it did not see."""
+        for v, what in ((grant_id, "grant_id"), (parent, "parent")):
+            if v is not None and not isinstance(v, str):
+                raise TypeError("%s must be a string or None" % what)
+        for v, what in ((scope, "scope"), (parent_scope, "parent_scope")):
+            if v is not None and (isinstance(v, bool) or not isinstance(v, int)):
+                raise TypeError("%s must be an integer or None" % what)
         with open(self.path + ".lock", "w") as lk:
             fcntl.flock(lk.fileno(), fcntl.LOCK_EX)
             try:
@@ -92,6 +100,10 @@ class Ledger:
                     # recorded on grant-scoped rows so ledger comparisons can tell
                     # the models apart after the fact.
                     entry["issuer_model"] = issuer_model
+                if parent is not None:
+                    entry["parent"] = parent
+                if parent_scope is not None:
+                    entry["parent_scope"] = parent_scope
                 chain = jcs.sha256(jcs.canonicalize(entry))
                 entry["prev_hash_chain"] = chain
                 with open(self.path, "a") as f:
@@ -102,8 +114,8 @@ class Ledger:
                         f.write("    " + prose.replace("\n", "\n    ") + "\n")
                 self._head_stat = self._stat_key()
                 self._head_cache = chain
-                if grant_id is not None:
-                    self._by_grant.setdefault(grant_id, []).append(entry)
+                for gid in {grant_id, parent} - {None}:
+                    self._by_grant.setdefault(gid, []).append(entry)
             finally:
                 fcntl.flock(lk.fileno(), fcntl.LOCK_UN)
         return entry
