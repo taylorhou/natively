@@ -57,15 +57,19 @@ def test_wire_msg_id_never_becomes_a_path(tmp_path, hub, principal):
 
 def test_decrypted_group_id_never_becomes_a_path(tmp_path, hub, principal):
     n1 = make_node(tmp_path, "n1", hub.url, principal, {"alpha": ["msg.send"]})
-    n2 = make_node(tmp_path, "n2", hub.url, principal, {"beta": ["msg.send"]})
-    evil = {"kind": "group_key", "group_id": "../../evil", "group_name": "g", "sender_fp": n1.fp,
+    n2 = make_node(tmp_path, "n2", hub.url, principal, {"beta": ["msg.send", "group.join"]})
+    # a grant that lets beta join any group: the id still has to be an id
+    g = issue_grant(n2, "beta", principal, max_uses=5,
+                    scope=[{"action": "group.join", "resource": "host:%s:groups" % n2.node_key, "params": {"keys": ["group_id"]}}])
+    evil = {"kind": "group_key", "action": "group.join", "resource": "host:%s:groups" % n2.node_key,
+            "params": {"group_id": "../../evil"}, "group_id": "../../evil", "group_name": "g", "sender_fp": n1.fp,
             "state": crypto.SenderKey().state(), "members": []}
-    n1.queue_send("alpha", agent_key(n2, "beta"), evil)
+    n1.queue_send("alpha", agent_key(n2, "beta"), evil, grant_ids=[g["grant_id"]])
     pump([n1, n2], 3)
     assert not os.path.exists(os.path.join(n2.home, "evil.json"))
     assert not os.path.exists(os.path.join(tmp_path, "evil.json"))
     assert not os.path.isdir(os.path.join(n2.home, "groups")) or os.listdir(os.path.join(n2.home, "groups")) == []
-    assert "rejected-bad-id" in outcomes(n2, "group.key")
+    assert outcomes(n2, "group.join") == ["malformed"] and outcomes(n2, "group.key") == []  # refused before any join, no use spent
     relay = {"kind": "group_relay", "group_id": "../../evil",
              "wire": {"kind": "group_msg", "group_id": "../../evil", "n": 0, "ct": "", "sender_fp": n1.fp}}
     n1.queue_send("alpha", agent_key(n2, "beta"), relay)
