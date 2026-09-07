@@ -7,13 +7,23 @@ anywhere.
 API (all JSON unless noted):
   PUT  /v1/prekey/<node_fp>   body: node-signed prekey bundle
   GET  /v1/prekey/<node_fp>
-  POST /v1/register           {node_fp, agents: [{name, agent_key, card}], sig}
+  POST /v1/register           {node_key, name, ts, agents: [{name, agent_key, card}], sig}
   GET  /v1/directory          -> {agents: {...}, nodes: {...}}
   POST /v1/msg                {envelope} -> {seq}
   GET  /v1/poll/<node_fp>?after=<seq>  (long-poll, timeout=25s)
+                              header X-Natively-Auth: node-signed poll token
   POST /v1/blob               raw ciphertext body -> {blob_id, size}
   GET  /v1/blob/<blob_id>     raw ciphertext
   GET  /v1/healthz
+
+Authentication (review 2026-09-07, point 1): a prekey bundle is stored only
+under the fingerprint of the node key that signed it; a registration
+carries a fresh `ts`, every agent card must be principal-signed and name
+this node's key and the registered agent key, and an agent key already
+owned by another node moves only with a card that supersedes the stored
+one; a poll (which reads AND prunes the node's queue) carries a token
+signed by the registered node key. `--principal-pub` restricts
+registration to cards issued by those principals.
 """
 import json
 import threading
@@ -21,13 +31,52 @@ import time
 import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from . import crypto, envelope, jcs
+
 MAX_BODY = 64 * 1024 * 1024  # 64MB blobs/envelopes cap
+REGISTER_WINDOW_S = 300      # a registration older/newer than this is replayed or misclocked
+POLL_TOKEN_WINDOW_S = 120    # a poll token older/newer than this is refused
+
+
+def fingerprint(node_key_b64: str) -> str:
+    """Fingerprint of a node key: the first 32 hex of SHA-256 over the raw
+    32-byte Ed25519 public key (the same derivation the node uses)."""
+    return jcs.sha256(crypto.b64d(node_key_b64))[:32]
+
+
+def _key_b64(prefixed) -> str:
+    """'ed25519:<b64>' -> '<b64>'; anything else -> ''."""
+    if not isinstance(prefixed, str) or not prefixed.startswith("ed25519:"):
+        return ""
+    return prefixed.split(":", 1)[1]
+
+
+def _verify_signed(obj, key_b64) -> bool:
+    """Signature check that never raises on malformed input."""
+    try:
+        if not isinstance(obj, dict) or not isinstance(obj.get("sig"), str) or not key_b64:
+            return False
+        return envelope.verify_obj(obj, key_b64)
+    except Exception:
+        return False
+
+
+def _within(ts, window_s) -> bool:
+    try:
+        return abs(envelope.parse_iso(ts) - time.time()) <= window_s
+    except Exception:
+        return False
 
 
 class State:
-    def __init__(self, path=None):
+    POLL_WAIT = 5.0  # long-poll wait when the queue is empty
+
+    def __init__(self, path=None, principal_roots=None):
         self.lock = threading.Lock()
         self.path = path
+        # optional allowlist of principal public keys (b64): when set, only
+        # cards issued by these principals register
+        self.principal_roots = set(principal_roots or [])
         self.blob_dir = os.path.join(os.path.dirname(os.path.abspath(path)), "blobs") if path else None
         self.prekeys = {}       # node_fp -> bundle
         self.nodes = {}         # node_fp -> {name, agents}
@@ -143,9 +192,71 @@ def make_server(port: int, state: State):
             self.end_headers()
             self.wfile.write(b)
 
+        # ---- authentication helpers ----
+        def _check_poll_token(self, fp, after):
+            """Poll token: header X-Natively-Auth carrying base64 of the
+            node-signed JSON {op: "poll", fp, after, ts, sig}. Returns an
+            error string, or None when the token authenticates `fp`."""
+            raw = self.headers.get("X-Natively-Auth")
+            if not raw:
+                return "poll token required"
+            try:
+                tok = json.loads(crypto.b64d(raw))
+            except Exception:
+                return "bad poll token"
+            if not isinstance(tok, dict):
+                return "bad poll token"
+            with st.lock:
+                node = st.nodes.get(fp)
+            if not node:
+                return "unknown node"
+            if not _verify_signed(tok, _key_b64(node.get("node_key"))):
+                return "bad poll token signature"
+            if tok.get("op") != "poll" or tok.get("fp") != fp or tok.get("after") != after:
+                return "poll token does not match request"
+            if not _within(tok.get("ts"), POLL_TOKEN_WINDOW_S):
+                return "poll token expired"
+            return None
+
+        def _card_for(self, agent_key_b64, owner_fp):
+            for v in st.agent_dir.values():
+                if v.get("node_fp") == owner_fp and _key_b64(v.get("agent_key")) == agent_key_b64:
+                    return v.get("card")
+            return None
+
+        def _check_agent(self, a, node_key, fp):
+            """One registered agent: a principal-signed card that names this
+            node's key and the registered agent key. Returns an error
+            string or None."""
+            if not isinstance(a, dict):
+                return "bad agent entry"
+            name, key, card = a.get("name"), a.get("agent_key"), a.get("card")
+            if not isinstance(name, str) or not name or "@" in name:
+                return "bad agent name"
+            if not _key_b64(key) or not isinstance(card, dict):
+                return "bad agent entry"
+            if card.get("agent_key") != key:
+                return "card agent_key does not match registered agent key"
+            if card.get("node_key") != node_key:
+                return "card node_key is not the registering node"
+            try:
+                ref = _key_b64(card.get("principal_key_ref"))
+                if not ref or not envelope.verify_card(card):
+                    return "card not verified"
+            except Exception:
+                return "card not verified"
+            if st.principal_roots and ref not in st.principal_roots:
+                return "card principal not in this hub's root set"
+            return None
+
         # ---- routing helpers ----
         def _route_node(self, env):
+            """Owner node of the envelope's recipient. Called under st.lock:
+            a registration replaces a node's ownership entries under the
+            same lock, so routing never sees the gap."""
             to = env.get("to", "")
+            if not isinstance(to, str):
+                return None
             if to.startswith("node:"):
                 return to.split(":", 2)[1]
             if to.startswith("ed25519:"):
@@ -176,7 +287,12 @@ def make_server(port: int, state: State):
                 for kv in q.split("&"):
                     if kv.startswith("after="):
                         after = int(kv[6:])
-                deadline = time.time() + 5
+                # a poll reads and prunes this node's queue: only the node
+                # whose registered key signed the token may do that
+                err = self._check_poll_token(fp, after)
+                if err:
+                    return self._json(401, {"error": err})
+                deadline = time.time() + st.POLL_WAIT
                 with st._cond(fp):
                     # seq skew self-heal (#15): a hub that rebooted from stale
                     # state has seq counters behind the nodes' cursors, and its
@@ -193,7 +309,7 @@ def make_server(port: int, state: State):
                             out = new
                             last = q_list[-1]["_seq"] if q_list else after
                             break
-                        st._cond(fp).wait(timeout=5)
+                        st._cond(fp).wait(timeout=st.POLL_WAIT)
                     # prune: entries at or below the node's cursor are durably
                     # handled node-side (it saves state before the next poll)
                     if after and fp in st.queues:
@@ -215,16 +331,22 @@ def make_server(port: int, state: State):
                     bundle = json.loads(b)
                 except Exception:
                     return self._json(400, {"error": "bad json"})
-                # verify bundle is signed by the node key it names
-                from . import crypto, jcs
-                nk = bundle.get("node_key", "").split(":", 1)[-1]
-                sig = bundle.get("sig")
-                obj = {k: v for k, v in bundle.items() if k != "sig"}
-                if not nk or not sig or not crypto.verify(crypto.b64d(nk), jcs.canonicalize(obj), crypto.b64d(sig)):
+                # verify bundle is signed by the node key it names, and that
+                # this key's fingerprint is the path it is stored under:
+                # nobody replaces another node's bundle with one of their own
+                if not isinstance(bundle, dict):
+                    return self._json(400, {"error": "bad bundle"})
+                nk = _key_b64(bundle.get("node_key"))
+                if not _verify_signed(bundle, nk):
                     return self._json(400, {"error": "bad bundle signature"})
+                try:
+                    if fingerprint(nk) != fp:
+                        return self._json(400, {"error": "bundle node_key does not match path"})
+                except Exception:
+                    return self._json(400, {"error": "bad node_key"})
                 with st.lock:
                     st.prekeys[fp] = bundle
-                    st.save()
+                    st.save(force=True)
                 return self._json(200, {"ok": True})
             return self._json(404, {"error": "not found"})
 
@@ -235,19 +357,66 @@ def make_server(port: int, state: State):
                     reg = json.loads(b)
                 except Exception:
                     return self._json(400, {"error": "bad json"})
-                from . import crypto, jcs
-                nk = reg.get("node_key", "").split(":", 1)[-1]
-                obj = {k: v for k, v in reg.items() if k != "sig"}
-                if not nk or not crypto.verify(crypto.b64d(nk), jcs.canonicalize(obj), crypto.b64d(reg.get("sig", ""))):
+                if not isinstance(reg, dict):
+                    return self._json(400, {"error": "bad register"})
+                nk = _key_b64(reg.get("node_key"))
+                if not _verify_signed(reg, nk):
                     return self._json(400, {"error": "bad register signature"})
-                fp = jcs.sha256(crypto.b64d(nk))[:32]
+                # a captured registration must not re-publish an old agent set
+                if not _within(reg.get("ts"), REGISTER_WINDOW_S):
+                    return self._json(400, {"error": "register ts outside window"})
+                try:
+                    fp = fingerprint(nk)
+                except Exception:
+                    return self._json(400, {"error": "bad node_key"})
+                agents = reg.get("agents", [])
+                if not isinstance(agents, list):
+                    return self._json(400, {"error": "agents must be a list"})
+                entries = {}
+                for a in agents:
+                    err = self._check_agent(a, reg["node_key"], fp)
+                    if err:
+                        return self._json(400, {"error": err})
+                    entries["%s@%s" % (a["name"], fp)] = {
+                        "agent_key": a["agent_key"], "card": a["card"], "node_fp": fp}
                 with st.lock:
-                    st.nodes[fp] = {"name": reg.get("name"), "node_key": reg["node_key"]}
-                    for a in reg.get("agents", []):
-                        st.agent_dir["%s@%s" % (a["name"], fp)] = {
-                            "agent_key": a["agent_key"], "card": a["card"], "node_fp": fp}
-                        st.agent_owner[a["agent_key"].split(":", 1)[1]] = fp
-                    st.save()
+                    # registrations from one node apply in ts order: a
+                    # captured earlier registration (still inside the
+                    # window) must not roll the agent set back
+                    prev = st.nodes.get(fp, {}).get("reg_ts")
+                    if prev and envelope.parse_iso(reg["ts"]) <= envelope.parse_iso(prev):
+                        return self._json(409, {"error": "registration not newer than the one on file"})
+                    # an agent key another node owns moves only with a card
+                    # that supersedes the one on file AND is issued by the
+                    # same principal (spec 2): the previous principal's word
+                    moved = []
+                    for e in entries.values():
+                        key = _key_b64(e["agent_key"])
+                        owner = st.agent_owner.get(key)
+                        if owner and owner != fp:
+                            old = self._card_for(key, owner)
+                            if (old is None or e["card"].get("supersedes") != envelope.obj_hash(old)
+                                    or e["card"].get("principal_key_ref") != old.get("principal_key_ref")):
+                                return self._json(409, {"error": "agent key owned by another node"})
+                            moved.append((key, owner))
+                    # replace this node's registration atomically: agents
+                    # absent from the new set are gone from the directory,
+                    # and a key that moved here leaves its old node's entry
+                    for name in [n for n, v in st.agent_dir.items() if v.get("node_fp") == fp]:
+                        del st.agent_dir[name]
+                    for key in [k for k, v in st.agent_owner.items() if v == fp]:
+                        del st.agent_owner[key]
+                    for key, owner in moved:
+                        for name in [n for n, v in st.agent_dir.items()
+                                     if v.get("node_fp") == owner and _key_b64(v.get("agent_key")) == key]:
+                            del st.agent_dir[name]
+                    st.nodes[fp] = {"name": reg.get("name"), "node_key": reg["node_key"], "reg_ts": reg["ts"]}
+                    for name, e in entries.items():
+                        st.agent_dir[name] = e
+                        st.agent_owner[_key_b64(e["agent_key"])] = fp
+                    # persisted before the 200: the ts ordering must hold
+                    # across a hub restart, not only until the next throttled save
+                    st.save(force=True)
                 return self._json(200, {"ok": True, "node_fp": fp})
             if self.path == "/v1/msg":
                 b = self._body()
@@ -257,19 +426,27 @@ def make_server(port: int, state: State):
                     return self._json(400, {"error": "bad json"})
                 if not env.get("msg_id") or not env.get("to"):
                     return self._json(400, {"error": "missing fields"})
-                node_fp = self._route_node(env)
-                # multi-recipient: "to" may be a list
-                targets = []
-                if isinstance(env.get("to"), list):
-                    for t in env["to"]:
-                        fp = st.agent_owner.get(t.split(":", 1)[1]) if t.startswith("ed25519:") else None
-                        if fp:
-                            targets.append(fp)
-                elif node_fp:
-                    targets = [node_fp]
-                if not targets:
-                    return self._json(404, {"error": "unknown recipient"})
                 with st.lock:
+                    # route and enqueue under the one lock a registration
+                    # replaces ownership under: no "unknown recipient" for
+                    # an agent whose node is re-registering right now
+                    node_fp = self._route_node(env)
+                    # multi-recipient: "to" may be a list
+                    targets = []
+                    if isinstance(env.get("to"), list):
+                        for t in env["to"]:
+                            fp = st.agent_owner.get(t.split(":", 1)[1]) if isinstance(t, str) and t.startswith("ed25519:") else None
+                            if fp:
+                                targets.append(fp)
+                    elif node_fp:
+                        targets = [node_fp]
+                    if not targets:
+                        return self._json(404, {"error": "unknown recipient"})
+                    # an envelope made for a node the recipient has since
+                    # left is refused: routed on, it could never be read
+                    to_node = env.get("to_node")
+                    if to_node is not None and targets != [to_node]:
+                        return self._json(409, {"error": "recipient moved", "node_fp": targets[0]})
                     for fp in targets:
                         # dedupe: a node re-POSTs unacked envelopes, so the
                         # same msg_id must never enqueue twice for one node
@@ -303,8 +480,8 @@ def make_server(port: int, state: State):
     return ThreadingHTTPServer(("0.0.0.0", port), H)
 
 
-def run(port=8471, state_path=None):
-    st = State(state_path)
+def run(port=8471, state_path=None, principal_roots=None):
+    st = State(state_path, principal_roots=principal_roots)
     srv = make_server(port, st)
     print("natively hub listening on :%d" % port)
     srv.serve_forever()
