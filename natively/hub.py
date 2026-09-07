@@ -28,15 +28,13 @@ class State:
     def __init__(self, path=None):
         self.lock = threading.Lock()
         self.path = path
+        self.blob_dir = os.path.join(os.path.dirname(os.path.abspath(path)), "blobs") if path else None
         self.prekeys = {}       # node_fp -> bundle
         self.nodes = {}         # node_fp -> {name, agents}
         self.agent_dir = {}     # "name@nodefp" -> {agent_key, card, node_fp}
         self.agent_owner = {}   # agent_key -> node_fp
         self.queues = {}        # node_fp -> [envelope,...]
         self.seq = {}           # node_fp -> last seq
-        self.blobs = {}         # blob_id -> bytes
-        self.blob_order = []    # fifo for eviction
-        self.blob_bytes = 0
         self.qids = {}          # node_fp -> set(msg_id) for O(1) dedupe
         self._last_save = 0.0
         self.cond = threading.Condition(self.lock)
@@ -57,12 +55,6 @@ class State:
             for fp, q in self.queues.items():
                 if len(q) > 500:
                     self.queues[fp] = q[-500:]
-            blobs_hex = d.get("blobs_hex", {})
-            if sum(len(v) for v in blobs_hex) > 32 * 1024 * 1024:
-                blobs_hex = {}
-            self.blobs = {k: bytes.fromhex(v) for k, v in blobs_hex.items()}
-            self.blob_order = list(self.blobs)
-            self.blob_bytes = sum(len(v) for v in self.blobs.values())
             for fp, q in self.queues.items():
                 self.qids[fp] = {m.get("env", {}).get("msg_id") for m in q}
         except Exception as e:
@@ -70,6 +62,35 @@ class State:
 
     BLOB_CAP = 64 * 1024 * 1024
     SAVE_INTERVAL = 2.0
+
+    def _blob_path(self, bid):
+        return os.path.join(self.blob_dir, bid) if self.blob_dir else None
+
+    def blob_put(self, bid, data):
+        p = self._blob_path(bid)
+        if not p:
+            return
+        os.makedirs(self.blob_dir, exist_ok=True)
+        with open(p, "wb") as f:
+            f.write(data)
+        # fifo evict by mtime when over cap
+        files = sorted((os.path.join(self.blob_dir, x) for x in os.listdir(self.blob_dir)),
+                       key=lambda x: os.path.getmtime(x))
+        total = sum(os.path.getsize(x) for x in files)
+        for x in files:
+            if total <= self.BLOB_CAP:
+                break
+            total -= os.path.getsize(x)
+            os.unlink(x)
+
+    def blob_take(self, bid):
+        p = self._blob_path(bid)
+        if not p or not os.path.exists(p):
+            return None
+        with open(p, "rb") as f:
+            d = f.read()
+        os.unlink(p)
+        return d
 
     def save(self, force=False):
         if not self.path:
@@ -80,8 +101,7 @@ class State:
             return
         self._last_save = now
         d = {"prekeys": self.prekeys, "nodes": self.nodes, "agent_dir": self.agent_dir,
-             "agent_owner": self.agent_owner, "queues": self.queues, "seq": self.seq,
-             "blobs_hex": {k: v.hex() for k, v in self.blobs.items()}}
+             "agent_owner": self.agent_owner, "queues": self.queues, "seq": self.seq}
         tmp = self.path + ".tmp"
         json.dump(d, open(tmp, "w"))
         os.replace(tmp, self.path)
@@ -141,15 +161,7 @@ def make_server(port: int, state: State):
                 return self._json(200, b) if b else self._json(404, {"error": "no bundle"})
             if p.startswith("/v1/blob/"):
                 bid = p.rsplit("/", 1)[1]
-                with st.lock:
-                    d = st.blobs.pop(bid, None)
-                    if d is not None:
-                        st.blob_bytes -= len(d)
-                        try:
-                            st.blob_order.remove(bid)
-                        except ValueError:
-                            pass
-                        st.save()
+                d = st.blob_take(bid)  # one-shot fetch; file store, no lock held
                 return self._raw(200, d) if d is not None else self._json(404, {"error": "no blob"})
             if p.startswith("/v1/poll/"):
                 rest = p[len("/v1/poll/"):]
@@ -269,15 +281,7 @@ def make_server(port: int, state: State):
                     return self._json(413, {"error": "too big"})
                 import hashlib
                 bid = hashlib.sha256(b).hexdigest()[:32]
-                with st.lock:
-                    if bid not in st.blobs:
-                        st.blobs[bid] = b
-                        st.blob_order.append(bid)
-                        st.blob_bytes += len(b)
-                        while st.blob_bytes > st.BLOB_CAP and st.blob_order:
-                            old = st.blob_order.pop(0)
-                            st.blob_bytes -= len(st.blobs.pop(old, b""))
-                    st.save()
+                st.blob_put(bid, b)  # file store on the volume, not the json state
                 return self._json(200, {"blob_id": bid, "size": len(b)})
             return self._json(404, {"error": "not found"})
 
