@@ -1,0 +1,211 @@
+# Natively Protocol Specification - v0.2 (draft)
+
+Status: draft, transport-agnostic. The envelope, the message rules, and
+the ledger are the protocol; the transport underneath is an adapter.
+
+## 1. Principles
+
+1. **Grants are the only instruction path.** A message without a grant
+   is information. It never becomes an action. This is enforced by the
+   receiving agent, mechanically - not by convention, and not by
+   remembering who said what in which channel.
+2. **Machine-rooted identity ("no ghost agents").** An agent
+   communicates natively only because it is resident on a machine
+   running a Natively node. Agent identity derives from node identity;
+   node identity derives from machine enrollment. Every message traces
+   to hardware and an owner.
+3. **Readable by principals.** The audit property is privacy from third
+   parties, never privacy from the principals. The principal's key is a
+   silent member of every session their agents hold, and every action
+   lands in a ledger the principal can read.
+4. **Keys live with humans.** A principal signing key that lives on an
+   agent's machine is the agent's key. Principal keys live where the
+   humans are (a password manager plus a small signing client). The
+   slow human signing step is a feature: it is the moment the scope
+   gets read.
+5. **Failure is shown, never swallowed.** A message that fails
+   verification is surfaced to the human with the reason, not dropped.
+
+### 1.1 What machine-rooted identity is and is not
+
+A node attests **residency**: this agent lives on this enrolled
+machine. That stops casual spoofing and makes provenance answerable.
+It is not proof of humanity. Virtual machines count as machines; a
+determined farm passes residency. The protocol's identity claims stop
+at hardware and owner, and any stronger claim belongs to a layer above
+this one.
+
+## 2. Identities
+
+- **Principal**: a human. Holds an Ed25519 key. Signs grants and agent
+  cards. The root of every chain.
+- **Node**: an enrolled machine. Holds an Ed25519 host key, enrolled by
+  its owner (a principal). Runs the Natively node software or the
+  equivalent plane (e.g. a Teale machine).
+- **Agent**: a process resident on a node. Holds an Ed25519 key,
+  vouched for by its node. Acts only inside grants issued to it.
+- **Agent card**: the identity document. `{agent key, node key,
+  principal key ref, capabilities, ledger url}`. Cards are signed by
+  the principal. If the card is the only identity document v0 needs,
+  DIDs are out of scope for v1 as well.
+
+Verification is against a pinned principal root, offline. There is no
+trust root beyond what the principals sign.
+
+## 3. Grant envelope
+
+JSON, canonicalized with JCS (RFC 8785), signed with Ed25519 over the
+canonical form of the envelope minus the `sig` field.
+
+```json
+{
+  "grant_id": "grt_<ulid>",
+  "issuer":  {"principal": "<name>", "key": "ed25519:<b64>"},
+  "subject": {"agent": "<agent-card-hash>", "key": "ed25519:<b64>"},
+  "audience": {"executor": "<node or agent key>"},
+  "scope": [{
+    "action": "node.config.set",
+    "resource": "host:<node-key>:<path-or-name>",
+    "params": {
+      "keys": ["max_concurrent_requests"],
+      "values": {"max_concurrent_requests": {"in": [1, 2, 4]}}
+    },
+    "offline_ok": false,
+    "max_offline_s": 300
+  }],
+  "principal_statement": "<the principal's verbatim words>",
+  "max_uses": 1,
+  "not_before": "...", "issued_at": "...", "expires_at": "...",
+  "revocation": {"ledger": "<url>", "max_check_interval_s": 300},
+  "parent_grant": null,
+  "sig": "<principal signature over JCS(envelope minus sig)>"
+}
+```
+
+Field semantics:
+
+- **scope** entries name an action and a resource narrowly. The
+  resource is bound to a host identity (`host:<node-key>:...`), never
+  to a bare label, so a grant cannot be replayed against a different
+  machine that happens to carry the same file. `params` constrains
+  values, not only key names: "set X, and X may only be one of these"
+  is encodable. The v0 constraint grammar is `in` / `range` / `regex`.
+- **audience** names the executing node or agent. A grant presented to
+  a different executor is invalid.
+- **principal_statement** is the human's verbatim words, signed
+  together with the scope. The scope is a lossy encoding of the words;
+  the words are how a human later recognizes their own statement. The
+  two are signed as one so the machine-readable part cannot drift from
+  the human-readable one.
+- **max_uses** defaults to 1. One-shot grants stop a stale grant from
+  driving a second action later.
+- **offline_ok / max_offline_s** are per scope entry. Offline tolerance
+  is only for scopes that read or report, never for scopes that change
+  state.
+- **Expiry is mandatory.** Revocation lookup happens before every
+  action outside `max_check_interval_s`. Lookup failure means fail
+  closed after grace.
+- **parent_grant** carries delegation. Depth one. A delegated grant
+  must be a strict subset of its parent's scope, and the chain must be
+  rooted in a principal signature. A grant signed only by an agent is
+  a request, never a word.
+
+## 4. Messages
+
+```json
+{"msg_id", "ts", "from", "to", "in_reply_to", "grant_ids": [...],
+ "body", "sig"}
+```
+
+Rules:
+
+- `grant_ids` empty: the message is information. Never action.
+- An action must fall inside the scope of a grant **whose subject is
+  the receiving agent**. A grant addressed to agent A, attached to a
+  message to agent B, is information for B. This closes the
+  confused-deputy class.
+- `msg_id` and `in_reply_to` live inside the envelope. Transport-level
+  message ids and thread identity are never trusted.
+- Receipts are an explicit `ack` message type; delivery and read
+  receipts are protocol objects, not transport hopes.
+- Ordering comes from the ledger (`prev_hash`), never from arrival
+  order at the transport.
+- Apply is idempotent, keyed on `msg_id`. Duplicates from the transport
+  are expected and harmless.
+- Bodies are base64. Shell metacharacters in a body must never reach a
+  shell.
+
+## 5. Ledger
+
+Append-only JSONL, one line per action taken against a grant:
+
+```json
+{"ts", "actor", "grant_id", "action", "params_hash", "outcome",
+ "prev_hash"}
+```
+
+- Hash-chained via `prev_hash`. Nodes reconcile by exchanging head
+  hashes each session.
+- Content hashes, not content: principals hold the bodies.
+- Every entry has a **prose mirror line** beside the JSONL. Machines
+  verify hashes; principals read prose. Both are kept, because each
+  audience trusts a different one.
+
+## 6. Revocation and failure
+
+- One signed message from a principal revokes an agent card and every
+  grant under it. Honored by all parties within a poll interval.
+- Lookup failure: fail closed after grace.
+- Executor exception: an action already in progress under a valid grant
+  finishes its current atomic step and rolls back if that step fails.
+  Revocation mid-flight never leaves a half-applied change. This is an
+  executor-side rule, not a grant-side flag.
+
+## 7. Transport adapters
+
+v0 transport is an adapter over whatever the deployments already have
+(message stores, mail, queues). The adapter contract:
+
+- envelope-carried `msg_id` / `in_reply_to` only;
+- explicit `ack` type for receipts, with retry timers sized to a poll
+  transport;
+- ordering from the ledger, transport order untrusted;
+- idempotent apply on `msg_id`;
+- base64 bodies end to end.
+
+Push delivery is desirable but not required for v0; delivery into the
+recipient's own message store is enough.
+
+## 8. Node model (federated)
+
+Anyone can run a node. Agents register with their node; nodes
+interoperate. A node:
+
+- enrolls as a machine, with its host key enrolled by its owning
+  principal;
+- vouches for resident agents and attests their residency;
+- routes messages to peer nodes and verifies inbound envelopes, cards,
+  and grants before delivery;
+- maintains its ledger share and reconciles head hashes.
+
+Because messages ride node identity, **authenticated machine enrollment
+is load-bearing**. A registry that accepts unauthenticated registration
+is a spoofing machine the moment messages flow over it. Enrollment
+authentication is a prerequisite for any live message plane, and node
+software must treat it that way.
+
+## 9. Deliberate omissions (v0)
+
+- DIDs (agent card + pinned principal root is enough).
+- Encryption at the protocol layer (privacy from the transport is a
+  round-two property; the v0 rule is no secrets in band at all).
+- Multi-principal co-sign.
+- Privacy from principals. Explicitly rejected: the property is
+  private-to-third-parties, readable-by-principals.
+
+## 10. Open items
+
+- Ack + retry timer defaults over poll transports.
+- Agent-card field set and versioning.
+- Revocation-list distribution format (per-ledger today).
+- Enrollment protocol for machine-rooted node identity.
