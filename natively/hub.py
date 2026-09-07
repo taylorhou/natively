@@ -134,7 +134,14 @@ def make_server(port: int, state: State):
             if p.startswith("/v1/blob/"):
                 bid = p.rsplit("/", 1)[1]
                 with st.lock:
-                    d = st.blobs.get(bid)
+                    d = st.blobs.pop(bid, None)
+                    if d is not None:
+                        st.blob_bytes -= len(d)
+                        try:
+                            st.blob_order.remove(bid)
+                        except ValueError:
+                            pass
+                        st.save()
                 return self._raw(200, d) if d is not None else self._json(404, {"error": "no blob"})
             if p.startswith("/v1/poll/"):
                 rest = p[len("/v1/poll/"):]
@@ -153,6 +160,14 @@ def make_server(port: int, state: State):
                             last = q_list[-1]["_seq"] if q_list else after
                             break
                         st.cond.wait(timeout=5)
+                    # prune: entries at or below the node's cursor are durably
+                    # handled node-side (it saves state before the next poll)
+                    if after and fp in st.queues:
+                        keep = [e for e in st.queues[fp] if e.get("_seq", 0) > after]
+                        if len(keep) != len(st.queues[fp]):
+                            st.queues[fp] = keep
+                            st.qids[fp] = {e.get("env", {}).get("msg_id") for e in keep}
+                            st.save()
                 return self._json(200, {"messages": out, "last_seq": last})
             return self._json(404, {"error": "not found"})
 
