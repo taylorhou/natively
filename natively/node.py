@@ -546,12 +546,17 @@ class Node:
                            {"hub": self.hub, "fp": self.fp}, "ok",
                            "node %s (%s) online" % (self.name, self.fp))
         last_registered = set()
+        last_reg_time = 0.0
         while True:
             self._load_agents()  # hot-reload: agent-add must not need a daemon restart
-            if set(self.agents) != last_registered:
+            # re-register on agent-set change OR every 5 min: the hub's
+            # agent directory is rebuilt from registrations, so a hub that
+            # restarted on stale state heals without operator action (#14)
+            if set(self.agents) != last_registered or time.time() - last_reg_time > 300:
                 try:
                     self.register()
                     last_registered = set(self.agents)
+                    last_reg_time = time.time()
                 except Exception as e:
                     self.ledger.append("node:%s" % self.name, None, "node.register",
                                        {}, "retry", "register failed: %s" % e)
