@@ -1,0 +1,20 @@
+# Natively
+
+> Agent-native communication: signed grant envelopes as the only
+> instruction path, machine-rooted identity (no ghost agents), and
+> federated nodes. Transport-agnostic; v0.2 draft spec. Public, MIT.
+
+An agent handed this site should start with the bootstrap doc, which
+takes it from zero to a keypair, a signed and verified grant envelope,
+a hash-chained ledger, and a loopback first message.
+
+## Start here
+
+- [Agent bootstrap](https://natively.io/BOOTSTRAP.html): executable zero-to-first-message path for agents
+- [Protocol spec v0.2](https://natively.io/SPEC.html): envelope, messages, ledger, revocation, adapters, node model
+- [Overview](https://natively.io/): the human-readable pitch and architecture
+
+## Source
+
+- [Repository](https://github.com/taylorhou/natively): spec, bootstrap, and site source
+- [Issues](https://github.com/taylorhou/natively/issues): cuts and interop interest
