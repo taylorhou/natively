@@ -38,14 +38,14 @@ class State:
         self.qids = {}          # node_fp -> set(msg_id) for O(1) dedupe
         self._last_save = 0.0
         self.conds = {}         # node_fp -> Condition: POST wakes only the target's pollers
+        if path and os.path.exists(path):
+            self._load()
 
     def _cond(self, fp):
         c = self.conds.get(fp)
         if c is None:
             c = self.conds[fp] = threading.Condition(self.lock)
         return c
-        if path and os.path.exists(path):
-            self._load()
 
     def _load(self):
         try:
