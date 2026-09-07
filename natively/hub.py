@@ -52,7 +52,15 @@ class State:
             self.agent_owner = d.get("agent_owner", {})
             self.queues = d.get("queues", {})
             self.seq = d.get("seq", {})
-            self.blobs = {k: bytes.fromhex(v) for k, v in d.get("blobs_hex", {}).items()}
+            # load-time clamp: a bloated state file must not OOM the boot.
+            # senders re-POST unacked envelopes, so deep backlog is recoverable.
+            for fp, q in self.queues.items():
+                if len(q) > 500:
+                    self.queues[fp] = q[-500:]
+            blobs_hex = d.get("blobs_hex", {})
+            if sum(len(v) for v in blobs_hex) > 32 * 1024 * 1024:
+                blobs_hex = {}
+            self.blobs = {k: bytes.fromhex(v) for k, v in blobs_hex.items()}
             self.blob_order = list(self.blobs)
             self.blob_bytes = sum(len(v) for v in self.blobs.values())
             for fp, q in self.queues.items():
