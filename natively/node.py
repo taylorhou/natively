@@ -261,6 +261,22 @@ class Node:
                 peer_fp = req.get("to_node_fp") or self._resolve_node(req["to"])
                 if not peer_fp:
                     raise ValueError("recipient not in directory")
+                if peer_fp == self.fp:
+                    # loopback: recipient agent is local - deliver in place;
+                    # the relay never sees intra-node traffic at all.
+                    to_key = req["to"].split(":")[-1]
+                    agent_name = None
+                    for nm, ag in self.agents.items():
+                        if ag["card"]["agent_key"] == "ed25519:" + to_key:
+                            agent_name = nm
+                            break
+                    if agent_name:
+                        fake_env = {"msg_id": envelope.new_id("msg"), "ts": envelope.now_iso(),
+                                    "from": self.agents[req["from_agent"]]["card"]["agent_key"],
+                                    "grant_ids": req["grant_ids"]}
+                        self._deliver_local(agent_name, fake_env, req["body_obj"])
+                    os.unlink(path)
+                    continue
                 ct_b64 = self._enc_pairwise(peer_fp, req["body_obj"])
                 env = envelope.make_message(
                     a["card"]["agent_key"].split(":", 1)[1], req["to"].split(":", 1)[-1],
@@ -306,6 +322,44 @@ class Node:
                                {"msg_id": env["msg_id"]}, "error", "decrypt failed: %s" % e)
             return
         kind = body.get("kind")
+        if kind == "group_key":
+            self._handle_group_key(agent_name, env, body, ack=True)
+            return
+        self._deliver_local(agent_name, env, body)
+        self._ack(env, agent_name)
+
+    def _handle_group_key(self, agent_name, env, body, ack=True):
+        gid = body["group_id"]
+        first_join = self._group(gid) is None
+        if first_join:
+            self.groups[gid] = {"group_id": gid, "name": body.get("group_name", ""),
+                                "creator": body.get("sender_fp"), "members": body.get("members", []),
+                                "_send": crypto.SenderKey(), "_recv": {},
+                                "send_state": None, "recv_states": {}}
+        self.groups[gid]["_recv"][body["sender_fp"]] = crypto.SenderKey.from_state(body["state"])
+        self._save_group(gid)
+        self.ledger.append("agent:%s" % agent_name, None, "group.join",
+                           {"group_id": gid}, "ok", "joined group %s" % body.get("group_name", gid))
+        if first_join:
+            # a joiner also speaks: distribute MY sender key to the group
+            g = self.groups[gid]
+            my_key = "ed25519:" + crypto.b64e(crypto.sign_pub(self.agents[agent_name]["seed"]))
+            for m in g.get("members", []):
+                if m["agent_key"].split(":")[-1] == my_key.split(":")[-1]:
+                    continue
+                self.queue_send(agent_name, m["agent_key"], {
+                    "kind": "group_key", "group_id": gid, "group_name": g.get("name", ""),
+                    "sender_fp": self.fp, "state": g["_send"].state(),
+                    "members": g.get("members", []),
+                })
+        if ack:
+            self._ack(env, agent_name)
+
+    def _deliver_local(self, agent_name, env, body):
+        kind = body.get("kind")
+        if kind == "group_key":
+            self._handle_group_key(agent_name, env, body, ack=False)
+            return
         if kind == "group_relay":
             wire = body["wire"]
             g = self._group(wire["group_id"])
@@ -313,9 +367,8 @@ class Node:
                 self.ledger.append("agent:%s" % agent_name, None, "group.recv",
                                    {"msg_id": env["msg_id"]}, "unknown-group", "no such group locally")
                 return
-            sender_node_fp = wire.get("sender_fp") or body.get("sender_fp") or sender_fp
             g2 = self.groups[wire["group_id"]]
-            sk = g2["_recv"].get(sender_node_fp)
+            sk = g2["_recv"].get(wire.get("sender_fp"))
             if sk is None:
                 self.ledger.append("agent:%s" % agent_name, None, "group.recv",
                                    {"msg_id": env["msg_id"]}, "no-sender-key", "missing sender key")
@@ -325,34 +378,6 @@ class Node:
             body = json.loads(pt)
             self._save_group(wire["group_id"])
             kind = body.get("kind")
-        if kind == "group_key":
-            gid = body["group_id"]
-            first_join = self._group(gid) is None
-            already = (not first_join) and body["sender_fp"] in self.groups[gid]["_recv"]
-            if first_join:
-                self.groups[gid] = {"group_id": gid, "name": body.get("group_name", ""),
-                                    "creator": body.get("sender_fp"), "members": body.get("members", []),
-                                    "_send": crypto.SenderKey(), "_recv": {},
-                                    "send_state": None, "recv_states": {}}
-            self.groups[gid]["_recv"][body["sender_fp"]] = crypto.SenderKey.from_state(body["state"])
-            self._save_group(gid)
-            self.ledger.append("agent:%s" % agent_name, None, "group.join",
-                               {"group_id": gid}, "ok", "joined group %s" % body.get("group_name", gid))
-            if first_join:
-                # a joiner also speaks: distribute MY sender key to the group
-                g = self.groups[gid]
-                my_key = a_key = "ed25519:" + crypto.b64e(crypto.sign_pub(self.agents[agent_name]["seed"]))
-                for m in g.get("members", []):
-                    if m["agent_key"].split(":")[-1] == my_key.split(":")[-1]:
-                        continue
-                    self.queue_send(agent_name, m["agent_key"], {
-                        "kind": "group_key", "group_id": gid, "group_name": g.get("name", ""),
-                        "sender_fp": self.fp, "state": g["_send"].state(),
-                        "members": g.get("members", []),
-                    })
-            self._ack(env, agent_name)
-            return
-        # informational/action content: write inbox record
         rec = {"msg_id": env["msg_id"], "ts": env["ts"], "from": env["from"],
                "agent": agent_name, "grant_ids": env.get("grant_ids", []), "body": body}
         ipath = os.path.join(self.home, "inbox", agent_name)
@@ -364,7 +389,6 @@ class Node:
         self.ledger.append("agent:%s" % agent_name, (env.get("grant_ids") or [None])[0],
                            "msg.recv", {"msg_id": env["msg_id"], "from": env["from"], "kind": kind},
                            outcome, "received %s from %s" % (kind, env["from"]))
-        self._ack(env, agent_name)
 
     def _apply_grants(self, env, agent_name, body):
         """Action path: a message with grant_ids asks for an action. v0
