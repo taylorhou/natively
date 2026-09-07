@@ -178,6 +178,14 @@ def make_server(port: int, state: State):
                         after = int(kv[6:])
                 deadline = time.time() + 5
                 with st._cond(fp):
+                    # seq skew self-heal (#15): a hub that rebooted from stale
+                    # state has seq counters behind the nodes' cursors, and its
+                    # queue entries are ghosts of messages the node already
+                    # durably handled. Fast-forward to the node's cursor so new
+                    # posts become visible again.
+                    if after > st.seq.get(fp, 0):
+                        st.seq[fp] = after
+                        st.save()
                     while True:
                         q_list = st.queues.get(fp, [])
                         new = [e for e in q_list if e.get("_seq", 0) > after]
