@@ -254,8 +254,28 @@ class Node:
                 return info["node_fp"]
         return None
 
+    def _maybe_reregister(self):
+        # re-register on agent-set change OR every 5 min: the hub's agent
+        # directory is rebuilt from registrations, so a hub that restarts
+        # heals without operator action (#14). Called from the run loop AND
+        # inside the outbox flush: with a 10k+ backlog one flush pass takes
+        # far longer than 300s, so a run-loop-only check effectively never
+        # fires on busy nodes (break #18).
+        if set(self.agents) == self._last_registered and time.time() - self._last_reg_time <= 300:
+            return
+        try:
+            self.publish_prekeys()  # hub may have lost them on a reboot
+            self.register()
+            self._last_registered = set(self.agents)
+            self._last_reg_time = time.time()
+        except Exception as e:
+            self.ledger.append("node:%s" % self.name, None, "node.register",
+                               {}, "retry", "register failed: %s" % e)
+
     def _flush_outbox(self):
-        for f in sorted(os.listdir(self.outbox_dir)):
+        for i, f in enumerate(sorted(os.listdir(self.outbox_dir))):
+            if i and i % 200 == 0:
+                self._maybe_reregister()
             if not f.endswith(".json"):
                 continue
             path = os.path.join(self.outbox_dir, f)
@@ -545,22 +565,11 @@ class Node:
         self.ledger.append("node:%s" % self.name, None, "node.start",
                            {"hub": self.hub, "fp": self.fp}, "ok",
                            "node %s (%s) online" % (self.name, self.fp))
-        last_registered = set()
-        last_reg_time = 0.0
+        self._last_registered = set()
+        self._last_reg_time = 0.0
         while True:
             self._load_agents()  # hot-reload: agent-add must not need a daemon restart
-            # re-register on agent-set change OR every 5 min: the hub's
-            # agent directory is rebuilt from registrations, so a hub that
-            # restarted on stale state heals without operator action (#14)
-            if set(self.agents) != last_registered or time.time() - last_reg_time > 300:
-                try:
-                    self.publish_prekeys()  # hub may have lost them on a stale-state reboot
-                    self.register()
-                    last_registered = set(self.agents)
-                    last_reg_time = time.time()
-                except Exception as e:
-                    self.ledger.append("node:%s" % self.name, None, "node.register",
-                                       {}, "retry", "register failed: %s" % e)
+            self._maybe_reregister()
             self._flush_outbox()
             try:
                 _, b = _http("GET", "%s/v1/poll/%s?after=%d" % (self.hub, self.fp, self.state["last_seq"]))
