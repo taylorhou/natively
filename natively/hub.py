@@ -37,7 +37,13 @@ class State:
         self.seq = {}           # node_fp -> last seq
         self.qids = {}          # node_fp -> set(msg_id) for O(1) dedupe
         self._last_save = 0.0
-        self.cond = threading.Condition(self.lock)
+        self.conds = {}         # node_fp -> Condition: POST wakes only the target's pollers
+
+    def _cond(self, fp):
+        c = self.conds.get(fp)
+        if c is None:
+            c = self.conds[fp] = threading.Condition(self.lock)
+        return c
         if path and os.path.exists(path):
             self._load()
 
@@ -171,7 +177,7 @@ def make_server(port: int, state: State):
                     if kv.startswith("after="):
                         after = int(kv[6:])
                 deadline = time.time() + 5
-                with st.cond:
+                with st._cond(fp):
                     while True:
                         q_list = st.queues.get(fp, [])
                         new = [e for e in q_list if e.get("_seq", 0) > after]
@@ -179,7 +185,7 @@ def make_server(port: int, state: State):
                             out = new
                             last = q_list[-1]["_seq"] if q_list else after
                             break
-                        st.cond.wait(timeout=5)
+                        st._cond(fp).wait(timeout=5)
                     # prune: entries at or below the node's cursor are durably
                     # handled node-side (it saves state before the next poll)
                     if after and fp in st.queues:
@@ -255,7 +261,7 @@ def make_server(port: int, state: State):
                     targets = [node_fp]
                 if not targets:
                     return self._json(404, {"error": "unknown recipient"})
-                with st.cond:
+                with st.lock:
                     for fp in targets:
                         # dedupe: a node re-POSTs unacked envelopes, so the
                         # same msg_id must never enqueue twice for one node
@@ -267,13 +273,14 @@ def make_server(port: int, state: State):
                         q.append(
                             {"env": env, "_seq": st.seq[fp], "_queued_for": fp})
                         ids.add(env.get("msg_id"))
-                        if len(q) > 5000:
-                            drop = q[:-5000]
-                            st.queues[fp] = q[-5000:]
+                        if len(q) > 500:
+                            drop = q[:-500]
+                            st.queues[fp] = q[-500:]
                             for m in drop:
                                 ids.discard(m.get("env", {}).get("msg_id"))
                     st.save()
-                    st.cond.notify_all()
+                    for fp in targets:
+                        st._cond(fp).notify_all()
                 return self._json(200, {"queued": len(targets)})
             if self.path == "/v1/blob":
                 b = self._body()
