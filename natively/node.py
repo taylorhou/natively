@@ -545,8 +545,16 @@ class Node:
         self.ledger.append("node:%s" % self.name, None, "node.start",
                            {"hub": self.hub, "fp": self.fp}, "ok",
                            "node %s (%s) online" % (self.name, self.fp))
+        last_registered = set()
         while True:
             self._load_agents()  # hot-reload: agent-add must not need a daemon restart
+            if set(self.agents) != last_registered:
+                try:
+                    self.register()
+                    last_registered = set(self.agents)
+                except Exception as e:
+                    self.ledger.append("node:%s" % self.name, None, "node.register",
+                                       {}, "retry", "register failed: %s" % e)
             self._flush_outbox()
             try:
                 _, b = _http("GET", "%s/v1/poll/%s?after=%d" % (self.hub, self.fp, self.state["last_seq"]))
