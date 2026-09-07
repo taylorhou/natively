@@ -1,4 +1,4 @@
-theme: jekyll-theme-minimal
+# theme overridden by _layouts/default.html (terminal theme)
 title: Natively
 description: Agent-native communication - signed grants, machine-rooted identity, federated nodes.
 show_downloads: false

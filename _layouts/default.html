@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ page.title | default: "natively bootstrap" }}</title>
+<meta name="description" content="{{ page.description | default: site.description }}">
+<style>
+  html, body { margin: 0; padding: 0; background: #000; }
+  body {
+    font-family: ui-monospace, "SF Mono", "Cascadia Code", Menlo, Consolas, monospace;
+    color: #cfe3cf;
+    background: radial-gradient(ellipse at 50% 30%, #04100a 0%, #000 70%);
+    line-height: 1.75;
+  }
+  body::after {  /* scanlines */
+    content: ""; position: fixed; inset: 0; pointer-events: none; z-index: 2;
+    background: repeating-linear-gradient(0deg, rgba(0,0,0,0.28) 0 1px, transparent 1px 3px);
+  }
+  .wrap { max-width: 46rem; margin: 0 auto; padding: 4rem 1.5rem 6rem; position: relative; z-index: 1; }
+  h1, h2, h3 { color: #e8f4e8; font-weight: 500; letter-spacing: 0.05em;
+    text-shadow: 0 0 12px rgba(74,246,38,0.18); }
+  h1 { font-size: 1.4rem; border-bottom: 1px solid rgba(74,246,38,0.25); padding-bottom: 0.6rem; }
+  h2 { font-size: 1.15rem; margin-top: 2.5rem; }
+  h3 { font-size: 1rem; }
+  p, li { font-size: 0.95rem; }
+  a { color: #4af626; text-decoration: none; border-bottom: 1px solid rgba(74,246,38,0.35);
+      text-shadow: 0 0 10px rgba(74,246,38,0.5); }
+  a:hover { background: rgba(74,246,38,0.10); }
+  code { background: rgba(74,246,38,0.08); color: #9ff28e; padding: 0.1em 0.35em;
+    border-radius: 3px; font-size: 0.9em; }
+  pre { background: #020604; border: 1px solid rgba(74,246,38,0.22); border-radius: 6px;
+    padding: 1rem 1.2rem; overflow-x: auto;
+    box-shadow: 0 0 24px rgba(74,246,38,0.06) inset; }
+  pre code { background: none; color: #b8d8b8; padding: 0; }
+  blockquote { border-left: 2px solid rgba(74,246,38,0.4); margin: 1.5rem 0;
+    padding: 0.2rem 0 0.2rem 1.2rem; color: #8aa58e; }
+  hr { border: none; border-top: 1px solid rgba(74,246,38,0.18); margin: 2.5rem 0; }
+  ul, ol { padding-left: 1.4rem; }
+  table { border-collapse: collapse; } th, td { border: 1px solid rgba(74,246,38,0.25); padding: 0.35rem 0.7rem; }
+  img { max-width: 100%; }
+</style>
+</head>
+<body>
+<div class="wrap">
+{{ content }}
+</div>
+</body>
+</html>
