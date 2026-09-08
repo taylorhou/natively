@@ -17,7 +17,7 @@ import urllib.parse
 import urllib.request
 import urllib.error
 from . import crypto, envelope, jcs
-from .ledger import Ledger
+from .ledger import Ledger, LedgerCorrupt
 from .revocation import Revocations, RevocationError, FeedUnavailable
 
 P = 5  # poll interval seconds (spec 4 sizing: ack_deadline 2P+jitter, retries 2P/4P/8P)
@@ -47,6 +47,45 @@ def _w600(path, data: bytes):
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     os.write(fd, data)
     os.close(fd)
+
+
+def _fsync_dir(d):
+    fd = os.open(d, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _w600_sync(path, data: bytes):
+    """A private file written durably: the bytes fsynced, then the
+    directory entry, and every directory this call had to create linked
+    durably in its parent. For records whose existence something else is
+    about to vouch for (an inbox record or a session before its receipt)."""
+    d = os.path.dirname(path)
+    created = []
+    probe = d
+    while probe and not os.path.isdir(probe):
+        created.append(probe)
+        probe = os.path.dirname(probe)
+    os.makedirs(d, exist_ok=True)
+    tmp = path + ".tmp"  # the previous durable copy stands until the new one is complete: never a truncated file
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+    _fsync_dir(d)
+    for made in created:  # deepest first: each new directory's link in its parent
+        _fsync_dir(os.path.dirname(made))
 
 
 def _http(method, url, body=None, timeout=35, ctype="application/json", headers=None):
@@ -253,15 +292,35 @@ class Node:
 
     # ---------- persistence ----------
     def _load_state(self):
+        """state.json as this node wrote it, or the empty state when there is
+        none. A file that does not parse or is not that shape refuses to
+        load (ValueError): a node never starts on a guessed cursor or an
+        empty seen set over history it cannot see."""
         p = self.state_path
-        if os.path.exists(p):
-            return json.load(open(p))
-        return {"last_seq": 0, "unacked": {}, "seen": []}
+        if not os.path.exists(p):
+            return {"last_seq": 0, "unacked": {}, "seen": []}
+        with open(p, "rb") as f:
+            st = jcs.loads(f.read())
+        if (not isinstance(st, dict) or isinstance(st.get("last_seq"), bool) or not isinstance(st.get("last_seq"), int)
+                or not isinstance(st.get("unacked"), dict) or not isinstance(st.get("seen"), list)):
+            raise ValueError("state.json is not the shape this node writes")
+        return st
 
     def _save_state(self):
+        """Atomic and durable: temp file, fsync, rename, the directory
+        fsynced (a rename the directory has not persisted can come back as
+        the old cursor after power loss)."""
         tmp = self.state_path + ".tmp"
-        json.dump(self.state, open(tmp, "w"))
+        with open(tmp, "w") as f:
+            json.dump(self.state, f)
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, self.state_path)
+        dfd = os.open(os.path.dirname(os.path.abspath(self.state_path)), os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
 
     def _load_agents(self):
         adir = os.path.join(self.home, "agents")
@@ -324,8 +383,11 @@ class Node:
         return None
 
     def _save_session(self, direction, peer_fp):
+        # durable: a receipt written after this must never survive a
+        # session that did not (the duplicate would be acked and the
+        # peer's handshake ephemeral dropped over a session that is gone)
         s = self.sessions[direction + ":" + peer_fp]
-        _w600(self._session_path(direction, peer_fp), json.dumps(s.to_state()).encode())
+        _w600_sync(self._session_path(direction, peer_fp), json.dumps(s.to_state()).encode())
 
     def _group_lock(self, gid):
         """Serialize group-state read-modify-write across PROCESSES sharing
@@ -1051,6 +1113,28 @@ class Node:
             self._save_state()
 
     # ---------- receive path ----------
+    def _reack_duplicate(self, env):
+        """A duplicate delivery of a message this node already ANSWERED
+        (its msg_id is in state["acked"]: an ack went out for it, after
+        delivery or a terminal drop): verify the envelope (shape and
+        signature) and, when it is a message to one of our agents, queue
+        the ack again. The body is never decrypted and nothing is
+        re-applied. A seen message that was never acked (refused, still
+        failing to decrypt) gets nothing: an ack is a receipt, not an
+        echo, and a duplicate that does not verify is ignored."""
+        acked = self.state.get("acked")
+        if not isinstance(acked, dict) or acked.get(env.get("msg_id")) != env.get("sig"):
+            return  # not the envelope this node answered: a re-signed one under a known id gets nothing
+        if env.get("type") != "msg" or envelope.check_message_shape(env) or not envelope.verify_message(env):
+            return
+        to_key = env["to"].split(":", 1)[-1]
+        for name, a in self.agents.items():
+            if a["card"]["agent_key"] == "ed25519:" + to_key:
+                self.ledger.append("node:%s" % self.name, None, "msg.recv", {"msg_id": env["msg_id"]},
+                                   "duplicate", "already handled: acking again, nothing re-applied")
+                self._ack(env, name)
+                return
+
     def _handle_envelope(self, env):
         """Every envelope, whatever its type, takes this one path: shape,
         signature, local recipient, sender card, ONE decryption, then
@@ -1273,8 +1357,7 @@ class Node:
         rec = {"msg_id": env["msg_id"], "ts": env["ts"], "from": env["from"],
                "agent": agent_name, "grant_ids": env.get("grant_ids", []), "body": body, "outcome": filed}
         ipath = os.path.join(self.home, "inbox", agent_name)
-        os.makedirs(ipath, exist_ok=True)
-        _w600(os.path.join(ipath, env["msg_id"] + ".json"), json.dumps(rec).encode())
+        _w600_sync(os.path.join(ipath, env["msg_id"] + ".json"), json.dumps(rec).encode())  # the helper creates and links inbox/<agent> itself  # durable before the receipt vouches for it
         # the receive row names the first WELL-FORMED grant id, or none
         gids = [g for g in (env.get("grant_ids") or []) if envelope.safe_id(g, "grt")]
         self.ledger.append("agent:%s" % agent_name, gids[0] if gids else None,
@@ -1628,6 +1711,23 @@ class Node:
         self._ack(env, agent_name)
 
     def _ack(self, env, agent_name):
+        # the receipt is on the record - the msg_id bound to the exact
+        # envelope (its signature) - and saved BEFORE the ack is queued: a
+        # duplicate of this envelope is answered again, a re-signed
+        # envelope under the same id is not, and a crash right after an
+        # action ran still leaves a receipt the sender's retry can collect
+        acked = self.state.get("acked")
+        if not isinstance(acked, dict):
+            acked = self.state["acked"] = {}
+        if acked.get(env.get("msg_id")) != env.get("sig"):
+            acked[env.get("msg_id")] = env.get("sig")
+            for old in list(acked)[:max(0, len(acked) - 5000)]:
+                del acked[old]
+            try:
+                self._save_state()
+            except BaseException:
+                acked.pop(env.get("msg_id"), None)  # no receipt in memory that is not on disk: a duplicate gets no ack until one is
+                raise
         try:
             sender_key = env["from"]
             body = {"kind": "ack", "ack": env["msg_id"], "ledger_head": self.ledger.head()}
@@ -1665,6 +1765,16 @@ class Node:
                                "ack for %s from a party it was not sent to" % mid)
             return False
         self.state["unacked"].pop(mid)
+        head = body.get("ledger_head")
+        if isinstance(head, str) and (head == "GENESIS" or (len(head) == 64 and all(c in "0123456789abcdef" for c in head))):
+            # reconciliation (spec 4, "acks double as reconciliation beacons"):
+            # the peer's declared head is RECORDED, per peer node, in the
+            # same save that consumes the ack - and nothing more: no
+            # repair, no trust, no comparison is automated here.
+            # `natively ledger peers` shows them; contents reconciliation is
+            # not implemented and the default is to do nothing with them.
+            self.state.setdefault("peer_heads", {})[sender_fp] = {
+                "head": head, "msg_id": mid, "ts": envelope.now_iso()}
         self._save_state()
         s = self._session("to", sender_fp)
         if s and s.hs_pending and self._carries_handshake(orig, s.x3dh_ek):
@@ -1757,6 +1867,10 @@ class Node:
 
     def start(self):
         """Lock the home, reconcile the hub cursor, publish and register."""
+        # startup verifies: a ledger whose chain does not verify is not
+        # something to append to - the node refuses to start and says why
+        if not self.ledger.verify_at_start():
+            raise LedgerCorrupt("ledger chain does not verify: %s" % self.ledger.path)
         # exclusive lock: two daemons on one home diverge session state
         import fcntl
         self._lockfd = open(os.path.join(self.home, "node.lock"), "w")
@@ -1824,8 +1938,21 @@ class Node:
                     self.state["last_seq"] = max(self.state["last_seq"], seq)
                     continue
                 if mid in self.state["seen"]:
+                    # a duplicate of a handled message is the sender's word
+                    # that our ack did not reach it: answer again, from the
+                    # verified envelope alone - nothing is re-applied or
+                    # re-decrypted; inside the same boundary as any other
+                    # envelope, so one bad card never kills the loop
+                    try:
+                        self._reack_duplicate(env)
+                    except Exception as e:
+                        self.ledger.append("node:%s" % self.name, None, "msg.recv",
+                                           {"msg_id": mid}, _oclass(e), "re-ack failed: %s" % e)
                     self.state["last_seq"] = max(self.state["last_seq"], seq)
                     continue
+                # the seen entry goes in before handling so an action's
+                # execution guard is durable (saved before the action runs);
+                # a failure that a retry can repair takes it out again
                 self.state["seen"].append(mid)
                 if len(self.state["seen"]) > 5000:
                     self.state["seen"] = self.state["seen"][-5000:]
