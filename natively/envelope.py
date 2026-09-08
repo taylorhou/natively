@@ -379,7 +379,8 @@ def check_grant_shape(g) -> None:
     _require(isinstance(rev, dict) and set(rev) == {"ledger", "max_check_interval_s"} and isinstance(rev["ledger"], str)
              and _pos_int(rev["max_check_interval_s"], MAX_SECONDS),
              "revocation must carry ledger and a positive max_check_interval_s (at most ten years)")
-    pg = g.get("parent_grant")
+    _require("parent_grant" in g, "parent_grant must be present (null for a root grant)")
+    pg = g["parent_grant"]
     _require(pg is None or safe_id(pg, "grt"), "parent_grant is not an identifier")
     windowed = ["max_uses_per_window" in sc for sc in scope]
     if "max_uses" in g:
@@ -389,18 +390,118 @@ def check_grant_shape(g) -> None:
         _require(all(windowed), "without max_uses every scope entry needs max_uses_per_window")
 
 
-def verify_grant(grant: dict, issuers, subject_card: dict = None, now=None) -> None:
-    """A root grant (parent_grant null): well formed, signed by one of
-    `issuers` (bare-b64 principal keys; an empty set fails closed), inside
-    its validity window, and every scope action inside the subject card's
-    capabilities when the card is given. Raises GrantError."""
+def make_delegated_grant(agent_seed: bytes, parent: dict, subject_card: dict, scope: list,
+                         statement: str, max_uses: int = 1, ttl_s: int = 86400) -> dict:
+    """A depth-one delegation: the parent's subject agent (holder of
+    `agent_seed`) hands a strict subset of the parent's scope to another
+    agent. Signed by the agent; verify_grant walks it back to the
+    principal-signed parent."""
+    from . import crypto
+    g = {
+        "grant_id": new_id("grt"),
+        "issuer": {"principal": parent["issuer"]["principal"],
+                   "key": "ed25519:" + crypto.b64e(crypto.sign_pub(agent_seed))},
+        "subject": {"agent": obj_hash(subject_card), "key": subject_card["agent_key"]},
+        "audience": dict(parent["audience"]),
+        "scope": scope,
+        "principal_statement": statement,
+        "max_uses": max_uses,
+        "not_before": now_iso(),
+        "issued_at": now_iso(),
+        "expires_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(min(time.time() + ttl_s, parse_iso(parent["expires_at"])))),
+        "revocation": dict(parent["revocation"]),
+        "parent_grant": parent["grant_id"],
+    }
+    if max_uses is None:
+        del g["max_uses"]
+    return sign_obj(g, agent_seed)
+
+
+def _rule_narrower(child, parent) -> bool:
+    """Is the child's constraint at least as tight as the parent's? Every
+    operator the parent uses must appear in the child with an equal or
+    narrower argument (in: subset; range: inside; regex: identical)."""
+    if "in" in parent:
+        if "in" not in child or not all(any(_same(x, y) for y in parent["in"]) for x in child["in"]):
+            return False
+    if "range" in parent:
+        if "range" not in child or child["range"][0] < parent["range"][0] or child["range"][1] > parent["range"][1]:
+            return False
+    if "regex" in parent and child.get("regex") != parent["regex"]:
+        return False
+    return True
+
+
+def scope_entry_within(child: dict, parent: dict) -> bool:
+    """Is a (shape-checked) child scope entry a subset of a parent entry?
+    Same action and resource; the child's key allowlist inside the
+    parent's; every parent value constraint present and no wider in the
+    child; a child budget or offline allowance no larger than the parent's."""
+    if child["action"] != parent["action"] or child["resource"] != parent["resource"]:
+        return False
+    cp, pp = child.get("params", {}), parent.get("params", {})
+    if not set(cp.get("keys", [])) <= set(pp.get("keys", [])):
+        return False
+    cv, pv = cp.get("values", {}), pp.get("values", {})
+    for k, rule in pv.items():
+        if k not in cv or not _rule_narrower(cv[k], rule):
+            return False
+    if "max_uses_per_window" in parent:
+        cw, pw = child.get("max_uses_per_window"), parent["max_uses_per_window"]
+        if cw is None or cw["n"] > pw["n"] or cw["window_s"] < pw["window_s"]:
+            return False
+    if child.get("offline_ok") and (not parent.get("offline_ok") or child["max_offline_s"] > parent["max_offline_s"]):
+        return False
+    return True
+
+
+def verify_grant(grant: dict, issuers, subject_card: dict = None, parent: dict = None, now=None,
+                 parent_subject_card: dict = None) -> None:
+    """A grant is valid when it is well formed, inside its validity
+    window, every scope action is inside the subject card's capabilities
+    (when the card is given), and its chain roots in a pinned principal:
+    a root grant (parent_grant null) is signed by one of `issuers`
+    (bare-b64 principal keys; an empty set fails closed); a delegated
+    grant names a parent (which the caller supplies, having looked it up
+    by that id), the parent is itself a valid ROOT grant, the child is
+    signed by the parent's subject key, shares the parent's audience,
+    lies inside the parent's validity window, and every child scope
+    entry is a subset of some parent entry. The parent is verified with
+    its own subject's card (parent_subject_card, which must be the card
+    the parent names by hash and key): a parent whose subject lacks a
+    capability is invalid, so it cannot delegate what it could never
+    exercise. Raises GrantError."""
     check_grant_shape(grant)
-    issuers = {r for r in (issuers or ()) if isinstance(r, str)}
-    _require(bool(issuers), "no pinned principal to check the issuer against")
-    ik = grant["issuer"]["key"][len("ed25519:"):]
-    _require(ik in issuers, "issuer not a pinned principal")
-    _require(verify_obj(grant, ik), "bad grant signature")
     t = time.time() if now is None else now
+    ik = grant["issuer"]["key"][len("ed25519:"):]
+    if grant["parent_grant"] is None:
+        issuers = {r for r in (issuers or ()) if isinstance(r, str)}
+        _require(bool(issuers), "no pinned principal to check the issuer against")
+        _require(ik in issuers, "issuer not a pinned principal")
+    else:
+        _require(parent is not None, "parent grant %s not held" % grant["parent_grant"])
+        _require(isinstance(parent, dict) and parent.get("grant_id") == grant["parent_grant"], "parent grant id mismatch")
+        _require(parent.get("parent_grant") is None, "delegation depth is one")
+        _require(isinstance(parent_subject_card, dict), "parent grant's subject card not resolved")
+        _require(obj_hash(parent_subject_card) == parent.get("subject", {}).get("agent")
+                 and parent_subject_card.get("agent_key") == parent.get("subject", {}).get("key"),
+                 "parent grant's subject card is not the card the parent names")
+        verify_grant(parent, issuers, subject_card=parent_subject_card, now=now)
+        _require(grant["issuer"]["key"] == parent["subject"]["key"], "delegated grant not issued by the parent's subject")
+        _require(grant["audience"] == parent["audience"], "delegated grant changes the audience")
+        # the child is revoked wherever the parent is: same feed, same interval
+        _require(grant["revocation"] == parent["revocation"],
+                 "delegated grant changes the revocation feed or its check interval")
+        _require(parse_iso(grant["not_before"]) >= parse_iso(parent["not_before"])
+                 and parse_iso(grant["expires_at"]) <= parse_iso(parent["expires_at"]),
+                 "delegated grant outlives its parent")
+        if "max_uses" in parent:
+            _require("max_uses" in grant and grant["max_uses"] <= parent["max_uses"],
+                     "delegated grant budget exceeds the parent's")
+        for sc in grant["scope"]:
+            _require(any(scope_entry_within(sc, psc) for psc in parent["scope"]),
+                     "delegated scope entry %s is not a subset of the parent's" % sc["action"])
+    _require(verify_obj(grant, ik), "bad grant signature")
     _require(parse_iso(grant["not_before"]) <= t, "grant not yet valid")
     _require(parse_iso(grant["expires_at"]) > t, "grant expired")
     if subject_card is not None:

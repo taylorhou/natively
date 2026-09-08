@@ -68,3 +68,33 @@ def test_a_malformed_row_already_on_disk_is_chained_but_not_indexed(tmp_path):
     assert len(reopened.rows_for_grant("grt_" + "0" * 26)) == 1
     reopened.append("agent:a", "grt_" + "0" * 26, "test.ping", {}, "ok", "pong")
     assert len(reopened.rows_for_grant("grt_" + "0" * 26)) == 2 and reopened.verify_chain()
+
+
+def test_rebuilding_the_index_keeps_the_stat_key(tmp_path):
+    """After another writer's rows are folded in, the object remembers the
+    file's stat as of that read: the next lookups on an unchanged file
+    cost nothing, and the head cache stays paired with the file it came
+    from (a rebuild that loses the key re-reads the whole file on every
+    lookup until this object appends)."""
+    path = str(tmp_path / "ledger.jsonl")
+    writer, reader = Ledger(path), Ledger(path)
+    gid = "grt_" + "0" * 26
+    for i in range(3):
+        writer.append("agent:a", gid, "test.ping", {"i": i}, "ok", "pong")
+    assert len(reader.rows_for_grant(gid)) == 3
+    assert reader._head_stat == reader._stat_key()
+    calls = []
+    real_open = open
+
+    def counting_open(*a, **kw):
+        calls.append(a[0])
+        return real_open(*a, **kw)
+    import builtins
+    orig = builtins.open
+    builtins.open = counting_open
+    try:
+        assert len(reader.rows_for_grant(gid)) == 3
+        assert reader.head() == writer.head()
+    finally:
+        builtins.open = orig
+    assert path not in calls
