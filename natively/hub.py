@@ -68,6 +68,25 @@ def _within(ts, window_s) -> bool:
         return False
 
 
+def _evict_to_cap(q, cap):
+    """Kind-aware queue trim. Control envelopes (group_key distributions and
+    other protocol control, marked class=control by the sender) are the
+    irreplaceable traffic: a chatter flood must never evict them (plane-test-1
+    soak: group_key distributions repeatedly evicted from capped queues by
+    relay firehoses, silently bricking group membership). Evict oldest DATA
+    first; evict control only when nothing else remains. Returns (kept,
+    dropped)."""
+    if len(q) <= cap:
+        return q, []
+    drop_n = len(q) - cap
+    data_idx = [i for i, m in enumerate(q) if m.get("_class") != "control"]
+    drop = set(data_idx[:drop_n])
+    if len(drop) < drop_n:  # not enough data: oldest control takes the rest
+        rest = [i for i in range(len(q)) if i not in drop]
+        drop |= set(rest[:drop_n - len(drop)])
+    return [m for i, m in enumerate(q) if i not in drop], [q[i] for i in sorted(drop)]
+
+
 class State:
     POLL_WAIT = 5.0  # long-poll wait when the queue is empty
 
@@ -108,8 +127,7 @@ class State:
             # load-time clamp: a bloated state file must not OOM the boot.
             # senders re-POST unacked envelopes, so deep backlog is recoverable.
             for fp, q in self.queues.items():
-                if len(q) > 500:
-                    self.queues[fp] = q[-500:]
+                self.queues[fp], _ = _evict_to_cap(q, 500)
             for fp, q in self.queues.items():
                 self.qids[fp] = {m.get("env", {}).get("msg_id") for m in q}
         except Exception as e:
@@ -457,26 +475,30 @@ def make_server(port: int, state: State):
                     to_node = env.get("to_node")
                     if to_node is not None and targets != [to_node]:
                         return self._json(409, {"error": "recipient moved", "node_fp": targets[0]})
+                    queued = 0
+                    deduped = 0
                     for fp in targets:
                         # dedupe: a node re-POSTs unacked envelopes, so the
                         # same msg_id must never enqueue twice for one node
                         ids = st.qids.setdefault(fp, set())
                         if env.get("msg_id") in ids:
+                            deduped += 1  # honest accounting: a skip is not a queue
                             continue
                         q = st.queues.setdefault(fp, [])
                         st.seq[fp] = st.seq.get(fp, 0) + 1
                         q.append(
-                            {"env": env, "_seq": st.seq[fp], "_queued_for": fp})
+                            {"env": env, "_seq": st.seq[fp], "_queued_for": fp,
+                             "_class": "control" if env.get("class") == "control" else "data"})
                         ids.add(env.get("msg_id"))
-                        if len(q) > 500:
-                            drop = q[:-500]
-                            st.queues[fp] = q[-500:]
-                            for m in drop:
-                                ids.discard(m.get("env", {}).get("msg_id"))
+                        queued += 1
+                        kept, dropped = _evict_to_cap(q, 500)
+                        st.queues[fp] = kept
+                        for m in dropped:
+                            ids.discard(m.get("env", {}).get("msg_id"))
                     st.save()
                     for fp in targets:
                         st._cond(fp).notify_all()
-                return self._json(200, {"queued": len(targets)})
+                return self._json(200, {"queued": queued, "deduped": deduped})
             if self.path == "/v1/blob":
                 b = self._body()
                 if b is None:
