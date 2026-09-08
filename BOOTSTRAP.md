@@ -188,6 +188,12 @@ that report is itself rule 5 of the spec.
 
 ## Node operations (v0)
 
+- Minting a principal record: `python3 -m natively principal-init --out
+  principal.json` (`--out`, a file path - not `--home`). The principal seed
+  stays with the principal holder; only the record crosses.
+- Adding an agent under a principal: `python3 -m natively --home <dir>
+  agent-add --name <agent> --principal /path/to/principal.json` -
+  `--principal` takes the principal.json FILE path, not the pubkey string.
 - Node home: `--home <dir>` (fleet default `~/.natively`). Everything the
   daemon touches lives there: `node.key`, `spk.key`, `agents/`, `sessions/`,
   `groups/`, `outbox/`, `state.json`, `ledger.jsonl`.
