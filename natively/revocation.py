@@ -36,7 +36,7 @@ import tempfile
 import time
 import urllib.request
 
-from . import envelope
+from . import envelope, jcs
 
 
 class RevocationError(Exception):
@@ -79,20 +79,11 @@ def verify_tombstone(t, roots) -> bool:
         return False
 
 
-def _no_dupes(pairs):
-    d = {}
-    for k, v in pairs:
-        if k in d:
-            raise ValueError("duplicate key: %r" % k)
-        d[k] = v
-    return d
-
-
 def _loads(text):
-    """json.loads for a file this node reads back or a feed line: a
-    duplicate key is an error, never the last value silently winning (a
-    first-wins and a last-wins reader would see different objects)."""
-    return json.loads(text, object_pairs_hook=_no_dupes)
+    """The strict JSON reader (jcs.loads) for a file this node reads back
+    or a feed line: a duplicate key or a non-finite number is an error,
+    never a value silently normalized."""
+    return jcs.loads(text)
 
 
 class FeedUnreadable(RevocationError):

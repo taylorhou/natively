@@ -11,7 +11,7 @@ import json
 
 from natively import node as nodemod
 
-from conftest import Principal, agent_key, inbox, make_node, outcomes, pump
+from conftest import Principal, agent_key, inbox, ledger_entries, make_node, outcomes, pump
 
 
 def test_two_nodes_exchange_a_message_and_an_ack(tmp_path, hub, principal):
@@ -455,3 +455,21 @@ def test_grant_from_an_unpinned_issuer_is_refused(tmp_path, hub, principal):
     pump([n1, n2], 4)
     assert outcomes(n2, "test.ping") == []
     assert "invalid" in outcomes(n2, "grant.check")
+
+
+def test_an_agent_card_that_does_not_load_is_that_agents_trouble_not_the_daemons(tmp_path, hub, principal):
+    """A hot-reloaded agent card with a duplicate key (or any file that the
+    strict reader refuses) is reported once and skipped; the other agents
+    keep delivering and the daemon pass never dies."""
+    n1 = make_node(tmp_path, "n1", hub.url, principal, {"alpha": ["msg.send"]})
+    n2 = make_node(tmp_path, "n2", hub.url, principal, {"beta": ["msg.send"], "gamma": ["msg.send"]})
+    cpath = os.path.join(n2.home, "agents", "gamma.card.json")
+    card = open(cpath).read().rstrip().rstrip("}")
+    with open(cpath, "w") as f:
+        f.write(card + ', "card_version": 1}')  # the key twice
+    n1.queue_send("alpha", agent_key(n2, "beta"), {"kind": "text", "text": "still here"})
+    pump([n1, n2], 6)
+    assert "gamma" not in n2.agents and "beta" in n2.agents
+    assert [r["body"]["text"] for r in inbox(n2, "beta")] == ["still here"]
+    assert [e["outcome"] for e in ledger_entries(n2) if e["action"] == "agent.load"] == ["error"]
+
