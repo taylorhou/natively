@@ -6,6 +6,7 @@ and authority ride inside as signed envelopes + cards + grants. A node runs
 per machine; agents are local processes using the CLI.
 """
 import calendar
+import hashlib
 import json
 import os
 import time
@@ -691,29 +692,81 @@ class Node:
         return {"kind": "group_key", "action": "group.join",
                 "resource": "host:%s:groups" % card["node_key"], "params": {"group_id": g["group_id"]},
                 "group_id": g["group_id"], "group_name": g.get("name", ""),
-                "sender_fp": self.fp, "state": g["initial_state"], "members": g.get("members", [])}
+                "sender_fp": self.fp, "state": g["initial_state"], "members": g.get("members", []),
+                "epoch": int(g.get("epoch", 0))}
 
-    def create_group(self, creator_agent, members, name="", grant_ids=None):
+    def create_group(self, creator_agent, members, name="", grant_ids=None, creator_grant_ids=None):
         """members: [{"agent_key": ..., "grant_ids": [...]}, ...] - the grant
         ids a member holds for group.join on its node (grant_ids is the
-        default for members that carry none)."""
+        default for members that carry none); creator_grant_ids are the
+        ones the creator holds on this node, so the members' own keys can
+        join here when they come back."""
         gid = envelope.new_id("grp")
-        members = [dict(m, grant_ids=m.get("grant_ids") or list(grant_ids or [])) for m in members]
+        creator_key = self.agents[creator_agent]["card"]["agent_key"]
+        members = [dict(m, grant_ids=m.get("grant_ids")
+                        or list((creator_grant_ids if m.get("agent_key") == creator_key else grant_ids) or []))
+                   for m in members]  # an explicit creator entry without its own grants gets the creator's, before any member default
+        if creator_key not in {m.get("agent_key") for m in members}:
+            # the creator is a member like any other (review point 9): a
+            # joiner's key fan-out and its replies reach only the members
+            # on the list it was handed, so a creator left off it never
+            # read the group it made. Its entry carries the join grants
+            # the creator holds on THIS node, which the joiners' key
+            # distributions cite when they reach it.
+            members.append({"agent_key": creator_key, "grant_ids": list(creator_grant_ids or [])})
         send = crypto.SenderKey()
         # my sender key goes to each member node, pairwise-encrypted, from
         # the daemon's pending pass: the work is persisted with the group
         # itself, and the lookups happen in bounded batches off one
         # directory read, never one hub round trip per member inside this call
-        g = {"group_id": gid, "name": name, "creator": creator_agent,
-             "members": members, "_send": send, "_recv": {}, "initial_state": send.state(),
+        g = {"group_id": gid, "name": name, "creator": creator_agent, "creator_fp": self.fp, "epoch": 0,
+             "members": members, "_send": send, "_recv": {}, "recv_epochs": {}, "initial_state": send.state(),
              "send_state": None, "recv_states": {},
              "pending": [{"agent": creator_agent, "agent_key": m["agent_key"], "grant_ids": m.get("grant_ids") or []}
-                         for m in members]}
+                         for m in members if m["agent_key"] != creator_key]}
         self.groups[gid] = g
         self._save_group(gid)
         return gid
 
+    def rotate_group_key(self, agent_name, gid):
+        """A fresh sender key for this node in `gid` at the next epoch,
+        distributed to every other member from the daemon's pending pass.
+        A member that holds this node's key at a lower epoch replaces it;
+        the old key's chain ends here. Rotate when membership changes or
+        the key may have left the group; relays queued after the rotation
+        follow the new key (the distribution is a control envelope and
+        goes ahead of them in the outbox order), relays still in flight
+        under the old key are lost at members that already rotated."""
+        with self._group_lock(gid):
+            g = self._group_reload(gid)
+            if g is None:
+                raise ValueError("unknown group")
+            my_key = self.agents[agent_name]["card"]["agent_key"]
+            if not self._may_rotate(g, agent_name, my_key):
+                raise ValueError("%s is not a member of %s: it cannot rotate the node's key there" % (agent_name, gid))
+            send = crypto.SenderKey()
+            g["_send"], g["initial_state"] = send, send.state()
+            g["epoch"] = int(g.get("epoch", 0)) + 1
+            g["pending"] = [{"agent": agent_name, "agent_key": m["agent_key"], "grant_ids": m.get("grant_ids") or [],
+                             "epoch": g["epoch"]}
+                            for m in g.get("members", []) if m.get("agent_key") != my_key]
+            self._save_group(gid)
+            self.ledger.append("agent:%s" % agent_name, None, "group.rotate", {"group_id": gid, "epoch": g["epoch"]},
+                               "ok", "sender key rotated to epoch %d; distribution queued to %d members" % (g["epoch"], len(g["pending"])))
+            return g["epoch"]
+
+    def _may_rotate(self, g, agent_name, my_key):
+        """A member rotates; so does the creator recorded on a group file
+        this node wrote before the creator was put on its own member list
+        (creator is the agent name there, creator_fp this node or absent).
+        A joiner-side record names the creator's NODE in creator and
+        another node in creator_fp, so nothing here admits it."""
+        if my_key in {m.get("agent_key") for m in g.get("members", []) if isinstance(m, dict)}:
+            return True
+        return g.get("creator") == agent_name and g.get("creator_fp", self.fp) == self.fp
+
     PENDING_BATCH = 20  # pending key distributions attempted per pass
+    FILED_KEEP = 256    # per local member and group sender: the newest counters already filed there (a second copy is never filed again)
 
     def _pending_update(self, gid, fn):
         """Change a group's pending list under the group lock, on the state
@@ -748,12 +801,16 @@ class Node:
     def _hold_group_key(self, agent_name, gid, member):
         self._hold_group_keys(agent_name, gid, [member])
 
-    def _release_group_key(self, gid, key):
+    def _release_group_key(self, gid, key, epoch=None):
+        """Take `key` off the pending list - only the entry for the epoch
+        whose key was actually queued (`epoch`), never one a rotation put
+        there since: that newer work is still owed."""
         def drop(g):
             pending = g.get("pending", [])
-            if not any(p["agent_key"] == key for p in pending):
+            keep = [p for p in pending if not (p["agent_key"] == key and (epoch is None or p.get("epoch", 0) == epoch))]
+            if len(keep) == len(pending):
                 return False
-            g["pending"] = [p for p in pending if p["agent_key"] != key]
+            g["pending"] = keep
             return True
         self._pending_update(gid, drop)
 
@@ -769,7 +826,9 @@ class Node:
         key = member["agent_key"]
         try:
             card, _ = self._peer_card(key, directory=directory)
-            self.queue_send(agent_name, key, self._group_key_body(self._group(gid), card),
+            g = self._group(gid)
+            epoch = int(g.get("epoch", 0))
+            self.queue_send(agent_name, key, self._group_key_body(g, card),
                             grant_ids=member.get("grant_ids") or [], control=True)
         except IdentityUnknown:
             self._hold_group_key(agent_name, gid, member)
@@ -779,14 +838,14 @@ class Node:
             # the pending list so the next pass does not repeat the lookup
             self.ledger.append("agent:%s" % agent_name, None, "group.key",
                                {"group_id": gid, "to": key}, "error", "cannot address member: %s" % e)
-            self._release_group_key(gid, key)
+            self._release_group_key(gid, key, member.get("epoch"))
             return False
         except Exception:
             # the hub unreachable, a directory that is not the shape the
             # hub speaks: transient - the member waits, the daemon goes on
             self._hold_group_key(agent_name, gid, member)
             return False
-        self._release_group_key(gid, key)
+        self._release_group_key(gid, key, epoch)  # only the entry for the key that went out; a rotation since stays owed
         return True
 
     def _retry_pending_group_keys(self):
@@ -821,12 +880,18 @@ class Node:
                                        "group state cannot be loaded: pending list is not the shape this node writes")
                 continue
             plist = [p for p in raw_pending if p["agent"] in self.agents]
-            if (gid not in self.groups or gid in self._bad_groups
-                    or self.groups[gid].get("pending", []) != (on_disk.get("pending") or [])):
+            cached = self.groups.get(gid)
+            if (cached is None or gid in self._bad_groups
+                    or cached.get("pending", []) != (on_disk.get("pending") or [])
+                    or cached.get("epoch", 0) != on_disk.get("epoch", 0)
+                    or cached.get("initial_state") != on_disk.get("initial_state")):
                 # not cached yet, or another process changed the pending
-                # list (the disk is the truth): read under the group lock,
-                # and a file that does not load is this group's trouble,
-                # never the daemon's - ledgered once, retried every pass
+                # list OR the key itself (a rotation from the CLI re-queues
+                # the same members at the next epoch: the list looks the
+                # same, the key does not) - the disk is the truth
+                # read under the group lock; a file that does not load is
+                # this group's trouble, never the daemon's - ledgered once,
+                # retried every pass
                 try:
                     with self._group_lock(gid):
                         self._group_reload(gid)
@@ -872,7 +937,11 @@ class Node:
         wire = {"kind": "group_msg", "group_id": gid, "n": n, "ct": crypto.b64e(ct),
                 "sender_fp": self.fp}
         local_keys = {a["card"]["agent_key"] for a in self.agents.values()}
+        my_key = self.agents[from_agent]["card"]["agent_key"]
+        by_node = {}  # member node fp -> the member keys on it: ONE relay per node
         for m in g["members"]:
+            if m["agent_key"] == my_key:
+                continue  # the sender is a member too; it does not relay to itself
             # Skip members whose card fails verification against the pinned
             # root set (retired principal, stale group file): queueing to
             # them only manufactures permanently-undeliverable outbox
@@ -898,9 +967,20 @@ class Node:
                 # either way: inbox files are local plaintext by design.
                 self.queue_send(from_agent, m["agent_key"], dict(body_obj, group_id=gid))
                 continue
-            self.queue_send(from_agent, m["agent_key"], {
-                "kind": "group_relay", "wire": wire, "group_id": gid,
-            }, inner_wire=wire)
+            by_node.setdefault(member_fp, []).append(m["agent_key"])
+        for member_fp, keys in by_node.items():
+            if member_fp is None:
+                # not registered yet: nothing known about where they live,
+                # one relay each as before
+                for k in keys:
+                    self.queue_send(from_agent, k, {"kind": "group_relay", "wire": wire, "group_id": gid}, inner_wire=wire)
+                continue
+            # one ciphertext per member NODE (spec 9.1): the relay names every
+            # recipient there, and the node decrypts once and files the
+            # plaintext for each of them - two local members no longer
+            # spend the same receive counter twice
+            self.queue_send(from_agent, keys[0], {"kind": "group_relay", "wire": wire, "group_id": gid,
+                                                  "recipients": keys}, inner_wire=wire)
         self._save_group(gid)
 
     # ---------- send path ----------
@@ -959,6 +1039,103 @@ class Node:
     LIVE_WINDOW = 300  # newest files sent first...
     DRAIN_SLICE = 100  # ...then a guaranteed slice of the oldest
 
+    def _split_relay(self, f, path, req, to_fp) -> bool:
+        """A group_relay naming several recipients was built for one member
+        node. Before it goes out, every named recipient is resolved again:
+        one that now lives on another node (moved since the relay was
+        queued) gets a relay of its own to that node, and this file keeps
+        only the recipients still on `to_fp` (the addressee's node). A
+        recipient the directory does not know right now stays here: it
+        was addressed with the rest and is retried with the rest. Returns
+        True when the file was rewritten."""
+        body = req.get("body_obj")
+        if not isinstance(body, dict) or body.get("kind") != "group_relay":
+            return False
+        named = body.get("recipients")
+        if not isinstance(named, list) or len(named) < 2:
+            return False
+        already = set(req.get("split") or [])  # recipients an earlier pass gave a file of their own: never a second one
+        stay, moved, unknown = [], {}, []
+        for k in named:
+            if k == req.get("to"):
+                stay.append(k)
+                continue
+            if k in already:
+                continue
+            try:
+                _, fp = self._peer_card(k)
+            except IdentityUnknown:
+                unknown.append(k)  # not in the directory right now: its own file, retried on its own until it resolves
+                continue
+            except IdentityError:
+                continue  # its card no longer verifies: it is dropped from the fan-out, as group_send would
+            (stay if fp == to_fp else moved.setdefault(fp, [])).append(k)
+        if not moved and not unknown and len(stay) + len(already & set(named)) == len(named):
+            return False
+        for keys in list(moved.values()) + [[k] for k in unknown]:
+            self.queue_send(req["from_agent"], keys[0], dict(body, recipients=keys),
+                            grant_ids=req.get("grant_ids") or [], control=bool(req.get("control")))
+        req["split"] = sorted(already | {k for keys in moved.values() for k in keys} | set(unknown))
+        if isinstance(req.get("env"), dict):
+            # this envelope has already been posted once (its answer was
+            # lost): the same bytes go again so the hub dedupes it, the
+            # recipients that left simply are not local at the node it
+            # names any more; the relays queued above carry theirs, and
+            # the split list written here keeps a later pass from queuing
+            # them again
+            _w600_replace(path, json.dumps(req).encode())
+            self.ledger.append("agent:%s" % req["from_agent"], None, "group.send", {"file": f},
+                               "split", "relay re-split: %d recipient(s) on other nodes, %d unresolved; the posted envelope is kept"
+                               % (sum(len(v) for v in moved.values()), len(unknown)))
+            return True
+        req["body_obj"] = dict(body, recipients=stay)
+        _w600_replace(path, json.dumps(req).encode())
+        self.ledger.append("agent:%s" % req["from_agent"], None, "group.send", {"file": f},
+                           "split", "relay re-split: %d recipient(s) on other nodes, %d unresolved"
+                           % (sum(len(v) for v in moved.values()), len(unknown)))
+        return True
+
+    def _repoint_relay(self, f, path, req, drop_addressee, exclude=()) -> bool:
+        """A grouped relay whose addressee cannot be resolved right now
+        (not in the directory), ever (its card does not verify), or is
+        still waiting for its key (exclude) must not strand the other
+        recipients it names: the first other recipient that resolves
+        becomes the addressee; the old one gets a file of its own to wait
+        in (or is dropped, when its card is bad). A relay whose envelope
+        was already posted is never re-addressed: those bytes may have
+        landed, so they go again as they are (the flush sends them to the
+        node they name) and the hub says whether they did. Returns True
+        when the file was re-addressed (the next pass sends it)."""
+        body = req.get("body_obj")
+        if not isinstance(body, dict) or body.get("kind") != "group_relay":
+            return False
+        if isinstance(req.get("env"), dict):
+            return False
+        named = body.get("recipients")
+        if not isinstance(named, list) or len(named) < 2:
+            return False
+        old = req.get("to")
+        others = [k for k in named if k != old]
+        for k in others:
+            if k in exclude or k in set(req.get("split") or []):
+                continue  # waiting for its key, or already on a file of its own: not the new addressee
+            try:
+                self._peer_card(k)
+            except IdentityError:
+                continue  # unknown or bad: not the new addressee (it stays named; the split sorts it out)
+            if not drop_addressee:
+                self.queue_send(req["from_agent"], old, dict(body, recipients=[old]),
+                                grant_ids=req.get("grant_ids") or [], control=bool(req.get("control")))
+            req["to"] = k
+            req["body_obj"] = dict(body, recipients=others)
+            req.pop("env", None)
+            _w600_replace(path, json.dumps(req).encode())
+            self.ledger.append("agent:%s" % req["from_agent"], None, "group.send", {"file": f}, "re-addressed",
+                               "relay re-addressed to a recipient that resolves; the old addressee %s"
+                               % ("dropped (bad card)" if drop_addressee else "waits in a file of its own"))
+            return True
+        return False
+
     def _relay_waits_for_key(self, req, cache) -> bool:
         """A group_relay to a member still on the group's pending list would
         arrive before the member's key distribution (which is not even
@@ -968,13 +1145,51 @@ class Node:
         if not isinstance(body, dict) or body.get("kind") != "group_relay":
             return False
         gid = body.get("group_id")
+        if "_queued_keys" not in cache:
+            # key distributions already queued but not yet accepted by the
+            # hub (their POST failed this pass or an earlier one): the
+            # control files go ahead of every relay in the flush order, so
+            # what is still on disk when the relays are reached is exactly
+            # what did not land - a relay to that recipient waits
+            queued = set()
+            for f in os.listdir(self.outbox_dir):
+                if f.startswith("ctl_") and f.endswith(".json"):
+                    try:
+                        r = json.load(open(os.path.join(self.outbox_dir, f)))
+                        b = r.get("body_obj")
+                        if isinstance(b, dict) and b.get("kind") == "group_key":
+                            to = r.get("to")
+                            queued.add((b.get("group_id"), to.split(":", 1)[1] if isinstance(to, str) and to.startswith("ed25519:") else to))
+                    except Exception:
+                        continue
+            cache["_queued_keys"] = queued
         if gid not in cache:
             try:
-                g = self._group(gid)
+                # from disk, once per pass: a rotation another process made
+                # since this daemon cached the group put every member back
+                # on the pending list, and a relay under the new key must
+                # not go out ahead of that key
+                g = self._group_reload(gid) if isinstance(gid, str) and envelope.safe_id(gid, "grp") else None
                 cache[gid] = {p.get("agent_key") for p in (g or {}).get("pending", []) if isinstance(p, dict)}
+                cache[gid] |= {k for (gk, k) in cache["_queued_keys"] if gk == gid}
+                cache[gid] |= {"ed25519:" + k for (gk, k) in cache["_queued_keys"] if gk == gid}
             except Exception:
                 cache[gid] = set()  # an unknown or unreadable group is not a reason to hold anything
         return req.get("to") in cache[gid]
+
+    @staticmethod
+    def _grouped(req) -> bool:
+        body = req.get("body_obj")
+        return (isinstance(body, dict) and body.get("kind") == "group_relay"
+                and isinstance(body.get("recipients"), list) and len(body["recipients"]) >= 2)
+
+    @staticmethod
+    def _stored_node(req):
+        """The node a posted envelope names, when this file carries one."""
+        env = req.get("env")
+        if isinstance(env, dict) and envelope.safe_fp(env.get("to_node")):
+            return env["to_node"]
+        return None
 
     def _flush_outbox(self):
         dead = {}  # recipient -> permanent identity verdict, this pass
@@ -1038,11 +1253,16 @@ class Node:
                 req = json.load(open(path))
                 self._file_to[f] = _bare_key(req.get("to"))
                 if self._relay_waits_for_key(req, pending_cache):
+                    # its key distribution has not been queued yet: the file
+                    # stays for a later pass - unless it names other
+                    # recipients whose key is out, who must not wait with it
+                    self._repoint_relay(f, path, req, drop_addressee=False,
+                                        exclude=pending_cache.get(req["body_obj"].get("group_id")) or ())
                     continue  # its key distribution has not been queued yet: the file stays for a later pass
                 if not f.startswith("ctl_") and _bare_key(req.get("to")) in held_to:
                     continue  # its recipient's control envelope is waiting on the hub: this file waits behind it (no attempt spent)
                 attempts += 1
-                if req["to"] in dead:
+                if req["to"] in dead and not self._grouped(req):
                     # a recipient already found permanently undeliverable in
                     # this pass (e.g. card principal not in the pinned root
                     # set): the verdict is deterministic, so every queued
@@ -1062,13 +1282,30 @@ class Node:
                 # the recipient's node is what its principal-signed card
                 # says, never the hub's routing field. Unknown = not
                 # registered yet: the send waits in the outbox.
+                stored_node = None
                 try:
                     _, peer_fp = self._peer_card(req["to"])
                 except IdentityUnknown:
-                    raise
+                    if self._stored_node(req):
+                        # posted once already (the answer was lost): the same
+                        # bytes go to the node they name, and the hub says
+                        # whether they landed - never a fresh envelope for
+                        # a delivery that may have happened
+                        peer_fp = stored_node = self._stored_node(req)
+                    elif self._repoint_relay(f, path, req, drop_addressee=False):
+                        continue
+                    else:
+                        raise
                 except IdentityError as e:
-                    dead[req["to"]] = str(e)
-                    raise ValueError("recipient identity: %s" % e)
+                    if self._stored_node(req):
+                        peer_fp = stored_node = self._stored_node(req)
+                    elif self._repoint_relay(f, path, req, drop_addressee=True):
+                        continue
+                    else:
+                        dead[req["to"]] = str(e)
+                        raise ValueError("recipient identity: %s" % e)
+                if self._split_relay(f, path, req, peer_fp):
+                    pass  # the recipients this relay named no longer all live where its addressee does: the others got relays of their own
                 if peer_fp == self.fp:
                     # loopback: recipient agent is local - deliver in place;
                     # the relay never sees intra-node traffic at all.
@@ -1087,17 +1324,22 @@ class Node:
                         raise IdentityUnknown("recipient no longer on this node; re-resolving")
                     fake_env = {"msg_id": envelope.new_id("msg"), "ts": envelope.now_iso(),
                                 "from": self.agents[req["from_agent"]]["card"]["agent_key"],
-                                "grant_ids": req["grant_ids"]}
+                                "to": req["to"] if req["to"].startswith("ed25519:") else "ed25519:" + req["to"],
+                                "grant_ids": req["grant_ids"], "_sender_fp": self.fp}
                     self._deliver_local(agent_name, fake_env, req["body_obj"])
                     os.unlink(path)
                     continue
                 env = req.get("env")
                 if not (isinstance(env, dict) and env.get("to_node") == peer_fp):
-                    # a send the hub asked to wait on (429) kept the envelope
-                    # it built in the request file: the same bytes go again,
-                    # one ratchet step per message however many passes the
-                    # hub refuses it. Only a recipient that moved gets a new
-                    # ciphertext.
+                    # The signed envelope is written into the request file
+                    # BEFORE its first POST and every later attempt sends
+                    # those same bytes: a POST whose answer was lost after
+                    # the hub accepted it is deduped by msg_id on the retry,
+                    # never a second logical message with a fresh id and a
+                    # fresh ratchet step (review point 9). Only a recipient
+                    # that moved (409, or a card now naming another node)
+                    # gets a new ciphertext. A 429-deferred send likewise
+                    # goes again as it is (review point 7).
                     ct_b64 = self._enc_pairwise(peer_fp, req["body_obj"])
                     # to_node: the node this ciphertext is for. The hub refuses
                     # (409) when the recipient now lives elsewhere, so a card
@@ -1111,17 +1353,31 @@ class Node:
                         a["card"]["agent_key"].split(":", 1)[1], req["to"].split(":", 1)[-1],
                         ct_b64, a["seed"], grant_ids=req["grant_ids"], in_reply_to=req.get("in_reply_to"),
                         msg_type=req["msg_type"], extra=extra)
+                    req["env"] = env
+                    _w600_replace(path, json.dumps(req).encode())
                 try:
                     self._hub_req("POST", "/v1/msg", json.dumps(env).encode())
                 except urllib.error.HTTPError as e:
                     if e.code == 409:
                         self._dir_cache = (0.0, None)
+                        req.pop("env", None)
+                        _w600_replace(path, json.dumps(req).encode())
                         raise RecipientMoved("recipient moved to another node; re-encrypting next pass")
                     if e.code == 404:
                         # the hub does not know the recipient right now (a
                         # re-registration gap, or not registered yet): wait,
                         # exactly as when the directory has no card for it
                         self._dir_cache = (0.0, None)
+                        if stored_node:
+                            # neither the directory nor the hub knows the
+                            # addressee any more: the posted bytes cannot
+                            # land there again, so the file gives them up
+                            # and is re-addressed next pass; a copy that did
+                            # land is filed once at most (the receiver keeps
+                            # what it filed per recipient and counter)
+                            req.pop("env", None)
+                            _w600_replace(path, json.dumps(req).encode())
+                            raise IdentityUnknown("addressee unknown to the hub and the directory; the posted envelope is given up")
                         raise IdentityUnknown("recipient unknown to the hub")
                     raise
                 # Acks never enter the retry table: an ack is an answer, not
@@ -1305,8 +1561,25 @@ class Node:
         if env["type"] == "ack":
             self._handle_ack(env, body, sender_fp)
             return
+        env["_sender_fp"] = sender_fp  # the node this envelope was verified and decrypted from
         self._deliver_local(agent_name, env, body)
         self._ack(env, agent_name)
+
+    @staticmethod
+    def _is_member(g, agent_key, sender_fp):
+        """Membership is the member list, plus the one AGENT whose key
+        founded this record (creator_key, the sender of the first
+        group_key) - an agent, never its node, so no other agent there
+        inherits anything. One more exception, for records written before
+        the creator was a member: a joiner-side record with no creator_fp
+        field (the creator's node was recorded from the first key, in
+        "creator") admits that node - the group cannot be told otherwise
+        and the creator is not on its list."""
+        if agent_key in {m.get("agent_key") for m in g.get("members", []) if isinstance(m, dict)}:
+            return True
+        if isinstance(agent_key, str) and agent_key == g.get("creator_key"):
+            return True
+        return "creator_fp" not in g and g.get("creator") == sender_fp
 
     @staticmethod
     def _check_group_key_body(body):
@@ -1324,6 +1597,9 @@ class Node:
             crypto.SenderKey.from_state(body.get("state"))
         except Exception:
             return "state is not a sender key"
+        epoch = body.get("epoch", 0)
+        if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 0:
+            return "epoch is not a counter"
         members = body.get("members")
         if not isinstance(members, list):
             return "members is not a list"
@@ -1352,6 +1628,14 @@ class Node:
             self.ledger.append("agent:%s" % agent_name, None, "group.key",
                                {"msg_id": env["msg_id"]}, "rejected-malformed", why)
             return False
+        if body["sender_fp"] != env.get("_sender_fp"):
+            # sender keys are symmetric: whoever holds one can make
+            # ciphertext attributed to its fp. The key is filed under the
+            # node the envelope was verified from, and only that node
+            self.ledger.append("agent:%s" % agent_name, None, "group.key",
+                               {"msg_id": env["msg_id"], "sender": body["sender_fp"]}, "rejected-wrong-sender",
+                               "group_key names sender %s but the envelope is from node %s" % (body["sender_fp"], env.get("_sender_fp")))
+            return False
         with self._group_lock(gid):
             return self._handle_group_key_locked(agent_name, env, body)
 
@@ -1360,7 +1644,16 @@ class Node:
         sender_key = crypto.SenderKey.from_state(body["state"])
         first_join = self._group_reload(gid) is None
         changed = False
+        epoch = int(body.get("epoch", 0))
         if not first_join:
+            g0 = self.groups[gid]
+            if not self._is_member(g0, env.get("from"), body["sender_fp"]):
+                # a key from an agent that is not on our member list joins
+                # nothing: membership widens only from a member's hand
+                self.ledger.append("agent:%s" % agent_name, None, "group.key",
+                                   {"msg_id": env.get("msg_id"), "sender": body["sender_fp"]}, "rejected-not-a-member",
+                                   "group_key from %s, which is not a member of %s here" % (env.get("from"), gid))
+                return False
             # Member-add via redistribution: a group_key whose member list is
             # a STRICT SUPERSET of ours adopts it - the list is otherwise
             # frozen at join and there is no other add path (found in the
@@ -1383,18 +1676,24 @@ class Node:
         # and every newer group text then rejects as 'replayed/old'. Only
         # accept a key for a sender we have no state for - and a duplicate
         # changes nothing, so it is no join and spends no use.
+        rotated = False
         if not first_join and body["sender_fp"] in self.groups[gid]["_recv"]:
-            self.ledger.append("agent:%s" % agent_name, None, "group.key",
-                               {"msg_id": env.get("msg_id"), "sender": body.get("sender_fp")},
-                               "ignored-duplicate", "already have recv key for this sender")
-            return True if changed else "duplicate"  # a wider member list is a change; the same key alone is not
+            have = self.groups[gid].setdefault("recv_epochs", {}).get(body["sender_fp"], 0)
+            if epoch <= have:
+                self.ledger.append("agent:%s" % agent_name, None, "group.key",
+                                   {"msg_id": env.get("msg_id"), "sender": body.get("sender_fp")},
+                                   "ignored-duplicate", "already have recv key for this sender at epoch %d" % have)
+                return True if changed else "duplicate"  # a wider member list is a change; the same key alone is not
+            rotated = True  # a higher epoch is the sender's rotation: it replaces the key we hold
         if first_join:
             send = crypto.SenderKey()
             self.groups[gid] = {"group_id": gid, "name": body.get("group_name", ""),
-                                "creator": body["sender_fp"], "members": body["members"],
-                                "_send": send, "_recv": {}, "initial_state": send.state(),
-                                "send_state": None, "recv_states": {}, "pending": []}
+                                "creator": body["sender_fp"], "creator_fp": body["sender_fp"],
+                                "creator_key": env.get("from"), "epoch": 0,
+                                "members": body["members"], "_send": send, "_recv": {}, "recv_epochs": {},
+                                "initial_state": send.state(), "send_state": None, "recv_states": {}, "pending": []}
         self.groups[gid]["_recv"][body["sender_fp"]] = sender_key
+        self.groups[gid].setdefault("recv_epochs", {})[body["sender_fp"]] = epoch
         if first_join:
             # a joiner also speaks: MY sender key goes to the group from the
             # daemon's pending pass (bounded batches off one directory read
@@ -1408,34 +1707,130 @@ class Node:
                             for m in g.get("members", []) if m["agent_key"].split(":")[-1] != my_key.split(":")[-1]]
         self._save_group(gid)
         self.ledger.append("agent:%s" % agent_name, None, "group.key",
-                           {"msg_id": env.get("msg_id"), "sender": body.get("sender_fp")},
-                           "ok", "installed recv key for sender %s" % body.get("sender_fp"))
+                           {"msg_id": env.get("msg_id"), "sender": body.get("sender_fp"), "epoch": epoch},
+                           "rotated" if rotated else "ok",
+                           "%s recv key for sender %s at epoch %d" % ("replaced" if rotated else "installed", body.get("sender_fp"), epoch))
         return True
 
     def _deliver_local(self, agent_name, env, body):
         kind = body.get("kind")
-        if kind == "group_relay":
-            wire = body["wire"]
-            if not envelope.safe_id(wire.get("group_id"), "grp"):
-                self.ledger.append("agent:%s" % agent_name, None, "group.recv",
-                                   {"msg_id": env["msg_id"]}, "rejected-bad-id", "group_id is not an identifier")
-                return
-            g = self._group(wire["group_id"])
+        if kind != "group_relay":
+            self._file_inbox(agent_name, env, body, kind)
+            return
+        wire = body.get("wire")
+        if not isinstance(wire, dict) or not envelope.safe_id(wire.get("group_id"), "grp"):
+            self.ledger.append("agent:%s" % agent_name, None, "group.recv",
+                               {"msg_id": env["msg_id"]}, "rejected-bad-id", "group_id is not an identifier")
+            return
+        gid = wire["group_id"]
+        # Sender keys are symmetric: any holder can make ciphertext that
+        # names another member's fp. The key is chosen by the node this
+        # envelope was verified and decrypted from, and the wire must name
+        # that node; and the sending agent must be a member here - decided
+        # below, under the group lock, on the membership as it is on disk.
+        sender_fp = env.get("_sender_fp")
+        if not envelope.safe_fp(sender_fp) or wire.get("sender_fp") != sender_fp:
+            self.ledger.append("agent:%s" % agent_name, None, "group.recv",
+                               {"msg_id": env["msg_id"], "sender": wire.get("sender_fp")}, "rejected-wrong-sender",
+                               "relay names sender %s but the envelope is from node %s" % (wire.get("sender_fp"), sender_fp))
+            return
+        named = body.get("recipients")
+        if named is None:
+            named = [env.get("to")]  # a relay without the list (an older sender): the addressee only
+        if (not isinstance(named, list) or not named
+                or not all(isinstance(k, str) for k in named) or env.get("to") not in named):
+            self.ledger.append("agent:%s" % agent_name, None, "group.recv",
+                               {"msg_id": env["msg_id"]}, "rejected-malformed", "recipients is not a list naming the addressee")
+            return
+        if not isinstance(wire.get("n"), int) or isinstance(wire.get("n"), bool) or not isinstance(wire.get("ct"), str):
+            self.ledger.append("agent:%s" % agent_name, None, "group.recv",
+                               {"msg_id": env["msg_id"]}, "rejected-malformed", "wire counter or ciphertext malformed")
+            return
+        # ONE decryption per relay, then the plaintext is filed for every
+        # named recipient that is a local agent and a member: two members
+        # on one node no longer spend the same receive counter twice. The
+        # receive state moves under the group lock, on the state as it is
+        # on disk (a rotation from another process is never overwritten
+        # from this daemon's cache). A relay carrying a counter already
+        # read here (a re-split fan-out, another recipient's copy, a copy
+        # that arrives after a restart) opens again under the message key
+        # the ratchet retained for it - durable with the receive state,
+        # and the same key opens only the same ciphertext. What was filed
+        # is recorded per local member and counter, with the state: a
+        # second copy of a message is never filed twice for one member,
+        # whatever envelope carries it.
+        with self._group_lock(gid):
+            g = self._group_reload(gid)
             if g is None:
                 self.ledger.append("agent:%s" % agent_name, None, "group.recv",
                                    {"msg_id": env["msg_id"]}, "unknown-group", "no such group locally")
                 return
-            g2 = self.groups[wire["group_id"]]
-            sk = g2["_recv"].get(wire.get("sender_fp"))
-            if sk is None:
+            # membership from the record just reloaded, never from this
+            # daemon's cache: a member another process added is served, one
+            # it removed is refused, in the same pass
+            if not self._is_member(g, env.get("from"), sender_fp):
                 self.ledger.append("agent:%s" % agent_name, None, "group.recv",
-                                   {"msg_id": env["msg_id"]}, "no-sender-key", "missing sender key")
+                                   {"msg_id": env["msg_id"], "from": env.get("from")}, "rejected-not-a-member",
+                                   "relay from %s, which is not a member of %s here" % (env.get("from"), gid))
                 return
-            pt = sk.decrypt_at(wire["n"], crypto.b64d(wire["ct"]),
-                               aad=b"nv1-grp:" + wire["group_id"].encode())
-            body = jcs.loads(pt)
-            self._save_group(wire["group_id"])
-            kind = body.get("kind")
+            member_keys = {m.get("agent_key") for m in g.get("members", []) if isinstance(m, dict)}
+            if sender_fp == self.fp:
+                # a relay this node made, looped back to a member that moved
+                # here after it was queued: this node holds no receive key
+                # for itself - the message reopens under the key its sender
+                # ratchet retained for it, and no chain moves
+                sk = g.get("_send")
+                if sk is None:
+                    self.ledger.append("agent:%s" % agent_name, None, "group.recv",
+                                       {"msg_id": env["msg_id"]}, "no-sender-key", "missing sender key")
+                    return
+                pt = sk.reopen(wire["n"], crypto.b64d(wire["ct"]), aad=b"nv1-grp:" + gid.encode())
+                epoch = int(g.get("epoch", 0))
+            else:
+                sk = g["_recv"].get(sender_fp)
+                if sk is None:
+                    self.ledger.append("agent:%s" % agent_name, None, "group.recv",
+                                       {"msg_id": env["msg_id"]}, "no-sender-key", "missing sender key")
+                    return
+                pt = sk.decrypt_at(wire["n"], crypto.b64d(wire["ct"]), aad=b"nv1-grp:" + gid.encode())
+                self._save_group(gid)  # the chain and the retained key, before anything is filed under them
+                epoch = int(g.get("recv_epochs", {}).get(sender_fp, 0))
+            inner = jcs.loads(pt)
+            if not isinstance(inner, dict):
+                self.ledger.append("agent:%s" % agent_name, None, "group.recv",
+                                   {"msg_id": env["msg_id"]}, "rejected-malformed", "group plaintext is not an object")
+                return
+            mark = "%d:%d" % (epoch, wire["n"])
+            filed = g.setdefault("filed", {}).setdefault(sender_fp, {})
+            local = [n for n, a in self.agents.items()
+                     if a["card"]["agent_key"] in named and a["card"]["agent_key"] in member_keys]
+            recipients = [n for n in local if mark not in (filed.get(n) or [])
+                          and not os.path.exists(os.path.join(self.home, "inbox", n, env["msg_id"] + ".json"))]
+            if not recipients:
+                self.ledger.append("agent:%s" % agent_name, None, "group.recv", {"msg_id": env["msg_id"]},
+                                   "duplicate" if local else "no-local-member",
+                                   "every named local member already holds this message" if local
+                                   else "no named recipient is a local member")
+                return
+            first_error = None
+            for name in recipients:
+                try:
+                    self._file_inbox(name, env, inner, inner.get("kind"))
+                except Exception as e:  # one recipient's trouble (its inbox unwritable) is not the others'
+                    first_error = first_error or e
+                    self.ledger.append("agent:%s" % name, None, "group.recv", {"msg_id": env["msg_id"]},
+                                       _oclass(e), "inbox record not written: %s" % e)
+                    continue
+                done = filed.setdefault(name, [])
+                done.append(mark)
+                del done[:-self.FILED_KEEP]
+            self._save_group(gid)  # what was filed, with the state it was filed under
+        if first_error is not None:
+            raise first_error  # the envelope is ledgered as failed and stays seen; the records that were written stand
+
+    def _file_inbox(self, agent_name, env, body, kind):
+        """The inbox record and receive row for one local agent: grants
+        applied when the message cites any, the outcome filed with it."""
         outcome = "delivered"
         if env.get("grant_ids"):
             outcome = self._apply_grants(env, agent_name, body)
