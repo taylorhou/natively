@@ -566,12 +566,12 @@ def test_a_crash_before_the_batch_save_does_not_let_a_message_execute_twice(tmp_
 
     def dies_at_the_batch_end():
         saves.append(1)
-        if len(saves) == 2:  # the first save is the one before the action; the second is the end of the poll
+        if len(saves) == 3:  # the first save is the one before the action, the second the receipt in _ack; the third is the end of the poll
             raise OSError("power lost")
         real_save()
     n2._save_state = dies_at_the_batch_end
     n2.step()
-    assert outcomes(n2, "test.ping") == ["ok"] and len(saves) == 2
+    assert outcomes(n2, "test.ping") == ["ok"] and len(saves) == 3
     n2.stop()
     time.sleep(1.1)
     n2b = nodemod.Node(n2.home)
