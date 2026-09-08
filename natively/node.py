@@ -627,7 +627,14 @@ class Node:
                 continue
             g = json.load(open(gpath))
             try:
-                envelope.verify_grant(g, self.principal_pub)
+                # a grant counts when its issuer is any pinned root (own
+                # principal.pub or an installed principals/<name>.pub) -
+                # the cross-principal exchange case; verify against the
+                # issuer named in the grant, never a fixed local key
+                ik = g.get("issuer", {}).get("key", "").split(":", 1)[-1]
+                if ik not in self.principal_roots:
+                    raise envelope.GrantError("grant issuer not in the pinned root set")
+                envelope.verify_grant(g, ik)
             except Exception as e:
                 self.ledger.append("agent:%s" % agent_name, gid, "grant.check", {}, "invalid", str(e))
                 continue

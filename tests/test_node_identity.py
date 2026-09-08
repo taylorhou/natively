@@ -412,3 +412,44 @@ def test_an_agent_whose_files_are_gone_leaves_the_next_registration(tmp_path, hu
     d = hub.state.agent_dir
     assert {k.split("@")[0] for k, v in d.items() if v["node_fp"] == n1.fp} == {"alpha", "delta"}
     assert hub.state.agent_owner[agent_key(n3, "omega").split(":", 1)[1]] == n3.fp
+
+
+def _install_grant(node, grant):
+    d = os.path.join(node.home, "grants")
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, grant["grant_id"] + ".json"), "w") as f:
+        json.dump(grant, f)
+
+
+def test_grant_from_a_pinned_second_root_executes(tmp_path, hub, principal):
+    other = Principal()
+    n1 = make_node(tmp_path, "n1", hub.url, other, {"alpha": ["msg.send"]}, roots=[other.pub, principal.pub])
+    n2 = make_node(tmp_path, "n2", hub.url, principal, {"beta": ["test.ping", "msg.send"]},
+                   roots=[principal.pub, other.pub])
+    g = envelope.make_grant(other.seed, "other", n2.agents["beta"]["card"],
+                            n2.agents["beta"]["card"]["node_key"].split(":", 1)[1],
+                            [{"action": "test.ping", "resource": ""}], "cross-principal ping", max_uses=1)
+    _install_grant(n2, g)
+    n1.queue_send("alpha", agent_key(n2, "beta"),
+                  {"kind": "action", "action": "test.ping", "resource": "", "params": {}},
+                  grant_ids=[g["grant_id"]])
+    pump([n1, n2], 4)
+    assert outcomes(n2, "test.ping") == ["ok"]
+    recs = inbox(n2, "beta")
+    assert recs and outcomes(n2, "msg.recv")[-1] == "acted:test.ping"
+
+
+def test_grant_from_an_unpinned_issuer_is_refused(tmp_path, hub, principal):
+    stranger = Principal()
+    n1 = make_node(tmp_path, "n1", hub.url, principal, {"alpha": ["msg.send"]})
+    n2 = make_node(tmp_path, "n2", hub.url, principal, {"beta": ["test.ping", "msg.send"]})
+    g = envelope.make_grant(stranger.seed, "stranger", n2.agents["beta"]["card"],
+                            n2.agents["beta"]["card"]["node_key"].split(":", 1)[1],
+                            [{"action": "test.ping", "resource": ""}], "forged ping", max_uses=1)
+    _install_grant(n2, g)
+    n1.queue_send("alpha", agent_key(n2, "beta"),
+                  {"kind": "action", "action": "test.ping", "resource": "", "params": {}},
+                  grant_ids=[g["grant_id"]])
+    pump([n1, n2], 4)
+    assert outcomes(n2, "test.ping") == []
+    assert "invalid" in outcomes(n2, "grant.check")
