@@ -37,7 +37,7 @@ class Ledger:
         return h
 
     def append(self, actor: str, grant_id, action: str, params, outcome: str,
-               prose: str) -> dict:
+               prose: str, issuer_model=None) -> dict:
         prev = self.head()
         entry = {
             "ts": jcs and __import__("time").strftime("%Y-%m-%dT%H:%M:%SZ", __import__("time").gmtime()),
@@ -48,6 +48,11 @@ class Ledger:
             "outcome": outcome,
             "prev_hash": prev,
         }
+        if issuer_model is not None:
+            # SPEC 3 issuer models: receiver-principal vs sender-principal,
+            # recorded on grant-scoped rows so ledger comparisons can tell
+            # the models apart after the fact.
+            entry["issuer_model"] = issuer_model
         chain = jcs.sha256(jcs.canonicalize(entry))
         entry["prev_hash_chain"] = chain
         with open(self.path, "a") as f:
