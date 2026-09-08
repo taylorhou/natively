@@ -10,6 +10,7 @@ import os
 import time
 import threading
 import http.client
+import fcntl
 import urllib.parse
 import urllib.request
 import urllib.error
@@ -120,6 +121,22 @@ def _oclass(e):
     return "error:" + type(e).__name__
 
 
+class _GroupFileLock:
+    def __init__(self, path):
+        self.path = path
+
+    def __enter__(self):
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        self.fh = open(self.path, "w")
+        fcntl.flock(self.fh.fileno(), fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc):
+        fcntl.flock(self.fh.fileno(), fcntl.LOCK_UN)
+        self.fh.close()
+        return False
+
+
 
 class Node:
     def __init__(self, home=None):
@@ -206,6 +223,21 @@ class Node:
     def _save_session(self, direction, peer_fp):
         s = self.sessions[direction + ":" + peer_fp]
         _w600(self._session_path(direction, peer_fp), json.dumps(s.to_state()).encode())
+
+    def _group_lock(self, gid):
+        """Serialize group-state read-modify-write across PROCESSES sharing
+        this home. node-run and bot processes each cache group state in
+        memory; without the lock every group_send rewrote the file from
+        stale cache - wiping keys other processes had installed and
+        forking the shared sender ratchet (receivers then rejected one
+        writer's envelopes as replayed/old). Found in the plane-test-1
+        soak: distributions installed at 06:18Z were gone from disk at
+        06:22Z behind bot chatter."""
+        return _GroupFileLock(self._group_path(gid) + ".lock")
+
+    def _group_reload(self, gid):
+        self.groups.pop(gid, None)
+        return self._group(gid)
 
     def _group_path(self, gid):
         return os.path.join(self.home, "groups", gid + ".json")
@@ -411,7 +443,11 @@ class Node:
         return gid
 
     def group_send(self, from_agent, gid, body_obj):
-        g = self._group(gid)
+        with self._group_lock(gid):
+            return self._group_send_locked(from_agent, gid, body_obj)
+
+    def _group_send_locked(self, from_agent, gid, body_obj):
+        g = self._group_reload(gid)
         if not g or not g.get("_send"):
             raise ValueError("unknown group or no sender key")
         pt = json.dumps(body_obj).encode()
@@ -686,8 +722,12 @@ class Node:
         self._ack(env, agent_name)
 
     def _handle_group_key(self, agent_name, env, body, ack=True):
+        with self._group_lock(body["group_id"]):
+            return self._handle_group_key_locked(agent_name, env, body, ack=ack)
+
+    def _handle_group_key_locked(self, agent_name, env, body, ack=True):
         gid = body["group_id"]
-        first_join = self._group(gid) is None
+        first_join = self._group_reload(gid) is None
         if first_join:
             self.groups[gid] = {"group_id": gid, "name": body.get("group_name", ""),
                                 "creator": body.get("sender_fp"), "members": body.get("members", []),
@@ -721,6 +761,9 @@ class Node:
         else:
             self.groups[gid]["_recv"][body["sender_fp"]] = crypto.SenderKey.from_state(body["state"])
             self._save_group(gid)
+            self.ledger.append("agent:%s" % agent_name, None, "group.key",
+                               {"msg_id": env.get("msg_id"), "sender": body.get("sender_fp")},
+                               "ok", "installed recv key for sender %s" % body.get("sender_fp"))
         self.ledger.append("agent:%s" % agent_name, None, "group.join",
                            {"group_id": gid}, "ok", "joined group %s" % body.get("group_name", gid))
         if first_join:
