@@ -129,6 +129,32 @@ class IdentityUnknown(IdentityError):
     refused as unknown."""
 
 
+class HubResponseError(OSError):
+    """The hub answered, but not with a document this node accepts (a
+    duplicate key, a non-object, not JSON at all). Nothing about the
+    recipient is decided by it: the same class as the hub being
+    unreachable - the send waits, the lookup is retried."""
+
+
+def _lookup_failed(e) -> bool:
+    """True when `e` is the hub being away or answering something this
+    node refuses - a transport failure, a hub-side 5xx, HubResponseError -
+    which decides nothing about an envelope. A 4xx answer, a disk error
+    and a cryptographic failure are verdicts or local trouble, not this."""
+    if isinstance(e, urllib.error.HTTPError):
+        return e.code >= 500
+    return isinstance(e, (HubResponseError, urllib.error.URLError, http.client.HTTPException))
+
+
+class HandlingDeferred(Exception):
+    """An inbound envelope could not be handled because the hub was away
+    or refused (its directory, its prekey bundle) BEFORE anything was
+    decided or executed for it: the receive loop leaves it unseen with the
+    cursor before it, and the hub serves it again on the next poll. Raised
+    only from the lookup phase - a failure after the envelope was
+    decrypted or its action ran is never this."""
+
+
 def node_fp_of(node_key_prefixed: str) -> str:
     return jcs.sha256(crypto.b64d(node_key_prefixed.split(":", 1)[1]))[:32]
 
@@ -213,6 +239,7 @@ class Node:
         self.principal_roots = set(roots)
         self._dir_cache = (0.0, None)
         self._bad_groups = set()  # groups whose file failed to load, ledgered once
+        self._bad_agents = set()  # agents whose files failed to load, ledgered once
         self.revocations = Revocations(self.home, self.principal_roots)
         self.ledger = Ledger(os.path.join(self.home, "ledger.jsonl"))
         self.state_path = os.path.join(self.home, "state.json")
@@ -251,8 +278,19 @@ class Node:
                 cpath = os.path.join(adir, name + ".card.json")
                 if not os.path.exists(cpath):
                     continue  # half-installed or half-removed: picked up when both files are there
-                seed = bytes.fromhex(open(os.path.join(adir, f)).read().strip())
-                card = json.load(open(cpath))
+                try:
+                    seed = bytes.fromhex(open(os.path.join(adir, f)).read().strip())
+                    card = jcs.loads(open(cpath, "rb").read())
+                except (OSError, ValueError, RecursionError) as e:
+                    # one agent's files that do not load are that agent's
+                    # trouble: reported once, the daemon and the other
+                    # agents go on
+                    if name not in self._bad_agents:
+                        self._bad_agents.add(name)
+                        self.ledger.append("node:%s" % self.name, None, "agent.load", {"agent": name}, "error",
+                                           "agent files cannot be loaded: %s" % e)
+                    continue
+                self._bad_agents.discard(name)
                 agents[name] = {"seed": seed, "card": card}
         self.agents = agents
 
@@ -268,6 +306,19 @@ class Node:
         p = self._session_path(direction, peer_fp)
         if os.path.exists(p):
             s = crypto.DRSession.from_state(json.load(open(p)))
+            if s.hs_pending and s.agreement != crypto.X3DH_VERSION:
+                # A handshake the peer never acknowledged, made under an
+                # older key agreement: the peer (once on this code) derives
+                # a different root from the same offer, so nothing sent on
+                # this channel can ever be read. Start over on the next
+                # send. An acknowledged channel is left alone - its root
+                # has done its work, the chains carry on.
+                os.unlink(p)
+                self.ledger.append("node:%s" % self.name, None, "session.reinit",
+                                   {"peer": peer_fp}, "ok",
+                                   "unacknowledged handshake under agreement %s discarded; the next send starts one under %s"
+                                   % (s.agreement, crypto.X3DH_VERSION))
+                return None
             self.sessions[key] = s
             return s
         return None
@@ -372,9 +423,12 @@ class Node:
         if not fresh and d is not None and time.time() - ts < 1.0:
             return d
         _, b = _http("GET", "%s/v1/directory" % self.hub)
-        d = json.loads(b)
+        try:
+            d = jcs.loads(b)
+        except ValueError as e:
+            raise HubResponseError("directory response refused: %s" % e)
         if not isinstance(d, dict) or not isinstance(d.get("agents"), dict):
-            raise ValueError("bad directory response")
+            raise HubResponseError("bad directory response")
         self._dir_cache = (time.time(), d)
         return d
 
@@ -415,7 +469,10 @@ class Node:
         """The peer's prekey bundle, accepted only when signed by a node key
         whose fingerprint is peer_fp (the fp came from a verified card)."""
         _, b = _http("GET", "%s/v1/prekey/%s" % (self.hub, peer_fp))
-        bundle = json.loads(b)
+        try:
+            bundle = jcs.loads(b)
+        except ValueError as e:
+            raise HubResponseError("prekey response refused: %s" % e)
         try:
             nk = bundle["node_key"].split(":", 1)[1]
             if node_fp_of(bundle["node_key"]) != peer_fp:
@@ -444,7 +501,8 @@ class Node:
             return s, (s.x3dh_ek if s.hs_pending else None)
         bundle = self._prekey_bundle(peer_fp)
         peer_spk_x = crypto.b64d(bundle["spk_x"])
-        root, ek = crypto.x3dh_initiator(self.node_seed, peer_spk_x)
+        peer_node_pub = crypto.b64d(bundle["node_key"].split(":", 1)[1])
+        root, ek = crypto.x3dh_initiator(self.node_seed, peer_node_pub, peer_spk_x)
         s = crypto.DRSession.init_initiator(root, peer_spk_x)
         s.x3dh_ek = ek
         s.hs_pending = True
@@ -469,6 +527,16 @@ class Node:
             self.sessions["from:" + peer_fp] = s
         return s
 
+    @staticmethod
+    def _carries_handshake(env, ek):
+        """True when this outgoing envelope's pairwise wire re-attached the
+        x3dh ephemeral `ek` - it was encrypted under that handshake."""
+        try:
+            wire = jcs.loads(crypto.b64d(env["body"]))  # the same strict reader as the receive side
+            return isinstance(wire, dict) and wire.get("x3dh_ek") == crypto.b64e(ek)
+        except Exception:
+            return False
+
     def _enc_pairwise(self, peer_fp, plaintext_obj):
         s, ek = self._session_for_send(peer_fp)
         pt = json.dumps(plaintext_obj).encode()
@@ -480,7 +548,7 @@ class Node:
         return crypto.b64e(json.dumps(wire).encode())
 
     def _dec_pairwise(self, peer_fp, body_b64):
-        wire = json.loads(crypto.b64d(body_b64))
+        wire = jcs.loads(crypto.b64d(body_b64))
         s = self._session_for_recv(peer_fp, wire.get("x3dh_ek"), wire["dh"])
         try:
             pt = s.decrypt(wire["dh"], crypto.b64d(wire["ct"]), aad=b"nv1-msg")
@@ -501,15 +569,16 @@ class Node:
                 # probe changes nothing.
                 s2 = self._x3dh_responder_session(peer_fp, wire["x3dh_ek"])
                 pt2 = s2.decrypt(wire["dh"], crypto.b64d(wire["ct"]), aad=b"nv1-msg")
+                body = jcs.loads(pt2)  # the same strict reader as the normal path, before anything is committed
                 self.sessions["from:" + peer_fp] = s2
                 self._save_session("from", peer_fp)
                 self.ledger.append("node:%s" % self.name, None, "session.heal",
                                    {"peer": peer_fp}, "ok",
                                    "adopted peer's re-attached x3dh handshake after decrypt failure")
-                return json.loads(pt2)
+                return body
             raise
         self._save_session("from", peer_fp)
-        return json.loads(pt)
+        return jcs.loads(pt)
 
     # ---------- groups ----------
     def _group_key_body(self, g, card):
@@ -1009,8 +1078,21 @@ class Node:
                                {"msg_id": env["msg_id"], "to": to_key}, "undeliverable",
                                "no local agent for recipient key")
             return
+        def resolve(fresh=False):
+            # the hub away, or answering something this node refuses,
+            # decides nothing about the envelope: handling is deferred and
+            # the hub serves it again - it is never consumed on that
+            try:
+                return self._peer_card(env["from"], fresh=fresh)[1]
+            except IdentityError:
+                raise
+            except Exception as e:
+                if _lookup_failed(e):
+                    raise HandlingDeferred(e)
+                raise
+
         try:
-            _, sender_fp = self._peer_card(env["from"])
+            sender_fp = resolve()
         except IdentityError as e:
             self.ledger.append("node:%s" % self.name, None, "msg.recv",
                                {"msg_id": env["msg_id"], "from": env["from"]}, "rejected-bad-card",
@@ -1019,11 +1101,17 @@ class Node:
         try:
             body = self._dec_pairwise(sender_fp, env["body"])
         except Exception as e:
+            if _lookup_failed(e):
+                # a fresh handshake needs the peer's prekey bundle: not
+                # fetched or refused is a lookup failure, not a decryption
+                # verdict. Only that: a session file this node cannot
+                # write is local trouble and takes the generic boundary
+                raise HandlingDeferred(e)
             # the sender may have moved to another node inside the
             # directory cache's lifetime: this ciphertext is then from the
             # new node's session. Re-resolve once, from the hub, and retry.
             try:
-                _, fresh_fp = self._peer_card(env["from"], fresh=True)
+                fresh_fp = resolve(fresh=True)
             except IdentityError:
                 fresh_fp = sender_fp
             if fresh_fp == sender_fp:
@@ -1032,6 +1120,8 @@ class Node:
             try:
                 body = self._dec_pairwise(fresh_fp, env["body"])
             except Exception as e2:
+                if _lookup_failed(e2):
+                    raise HandlingDeferred(e2)
                 self._decrypt_failed(env, agent_name, e2)
                 return
             sender_fp = fresh_fp  # the node this ciphertext really came from
@@ -1170,7 +1260,7 @@ class Node:
                 return
             pt = sk.decrypt_at(wire["n"], crypto.b64d(wire["ct"]),
                                aad=b"nv1-grp:" + wire["group_id"].encode())
-            body = json.loads(pt)
+            body = jcs.loads(pt)
             self._save_group(wire["group_id"])
             kind = body.get("kind")
         outcome = "delivered"
@@ -1199,10 +1289,10 @@ class Node:
             return None
         gpath = os.path.join(self.home, "grants", gid + ".json")
         try:
-            with open(gpath) as f:
-                g = json.load(f)
-        except (OSError, ValueError):
-            return None  # missing, unreadable or not JSON: not held; never an exception on the receive path
+            with open(gpath, "rb") as f:
+                g = jcs.loads(f.read())
+        except (OSError, ValueError, RecursionError):
+            return None  # missing, unreadable or not strict JSON: not held; never an exception on the receive path
         if not isinstance(g, dict) or g.get("grant_id") != gid:
             return None
         return g
@@ -1577,7 +1667,11 @@ class Node:
         self.state["unacked"].pop(mid)
         self._save_state()
         s = self._session("to", sender_fp)
-        if s and s.hs_pending:
+        if s and s.hs_pending and self._carries_handshake(orig, s.x3dh_ek):
+            # only an ack for an envelope sent under THIS handshake proves
+            # the peer holds this channel; an ack for a message from an
+            # earlier, restarted channel (a terminal drop of something it
+            # could never read) proves nothing about the current one
             s.hs_pending = False
             s.x3dh_ek = None
             self._save_session("to", sender_fp)
@@ -1706,7 +1800,9 @@ class Node:
             after = self.state["last_seq"]
             _, b = self._hub_req("GET", "/v1/poll/%s?after=%d" % (self.fp, after),
                                  headers={"X-Natively-Auth": self._auth_token("poll", after=after)})
-            d = json.loads(b)
+            d = jcs.loads(b)
+            if not isinstance(d, dict) or not isinstance(d.get("messages", []), list):
+                raise ValueError("bad poll response")
             for item in d.get("messages", []):
                 if not isinstance(item, dict):
                     self.ledger.append("node:%s" % self.name, None, "msg.recv", {}, "rejected-malformed",
@@ -1735,6 +1831,19 @@ class Node:
                     self.state["seen"] = self.state["seen"][-5000:]
                 try:
                     self._handle_envelope(env)
+                except HandlingDeferred as e:
+                    # the hub was away or refused while the sender's card
+                    # or prekeys were looked up, before anything was
+                    # decided or executed: the envelope is not seen and
+                    # the cursor stays before it. The hub serves it again
+                    # on the next poll; the rest of this page waits with
+                    # it. A failure AFTER decryption or execution is not
+                    # this class: it is ledgered below and the message
+                    # stays seen, so nothing runs twice.
+                    self.state["seen"].remove(mid)
+                    self.ledger.append("node:%s" % self.name, None, "msg.recv",
+                                       {"msg_id": mid}, "retry", "handling deferred, the next poll serves it again: %s" % e.args[0])
+                    break
                 except Exception as e:
                     # per-envelope boundary (#16): one poison message
                     # must never kill the loop or block the queue
@@ -1742,7 +1851,10 @@ class Node:
                                        {"msg_id": mid}, _oclass(e), "handle failed: %s" % e)
                 self.state["last_seq"] = max(self.state["last_seq"], seq)
             self._save_state()
-        except (urllib.error.URLError, OSError) as e:
+        except (urllib.error.URLError, OSError, ValueError):
+            # hub unreachable, or a poll response that is not the JSON
+            # shape the hub speaks (a duplicate key, a non-object): the
+            # next pass polls again; nothing in the queue is consumed
             pass
         self._retries()
 

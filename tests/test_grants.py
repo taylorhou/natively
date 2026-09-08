@@ -118,8 +118,11 @@ def test_grant_schema_is_closed(principal):
     refused("max_uses_per_window", scope=[{"action": "test.ping", "resource": res, "params": {}, "max_uses_per_window": {"n": 0, "window_s": 60}}])
     refused("max_offline_s", scope=[{"action": "test.ping", "resource": res, "params": {}, "offline_ok": True}])
     refused("max_offline_s", scope=[{"action": "test.ping", "resource": res, "params": {}, "offline_ok": False, "max_offline_s": "forever"}])
-    refused("ten years", scope=[{"action": "test.ping", "resource": res, "params": {}, "max_uses_per_window": {"n": 1, "window_s": 10 ** 400}}])
+    refused("ten years", scope=[{"action": "test.ping", "resource": res, "params": {}, "max_uses_per_window": {"n": 1, "window_s": 10 ** 9}}])
     refused("ten years", revocation={"ledger": "", "max_check_interval_s": 10 ** 12})
+    # an integer beyond 2^53 has no exact double: JCS refuses to sign it at all
+    with pytest.raises(ValueError, match="double"):
+        envelope.sign_obj(dict(ok, max_uses=2 ** 53 + 1), principal.seed)
     refused("regex", scope=[{"action": "test.ping", "resource": res, "params": {"keys": ["x"], "values": {"x": {"regex": "a{4294967296}"}}}}])
     # a non-finite float (1e400 parses to inf) cannot be signed at all - JCS
     # refuses it - and the grammar refuses it on its own too

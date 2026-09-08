@@ -16,6 +16,11 @@ API (all JSON unless noted):
   GET  /v1/blob/<blob_id>     raw ciphertext
   GET  /v1/healthz
 
+Every JSON body is parsed with jcs.loads (review point 5): an object with
+a duplicate key, or a number JSON cannot carry (NaN, Infinity, out of
+range), is a 400, never a silently normalized object whose signature a
+first-wins reader would judge differently.
+
 Authentication (review 2026-09-07, point 1): a prekey bundle is stored only
 under the fingerprint of the node key that signed it; a registration
 carries a fresh `ts`, every agent card must be principal-signed and name
@@ -249,7 +254,7 @@ def make_server(port: int, state: State):
             if not raw:
                 return "poll token required"
             try:
-                tok = json.loads(crypto.b64d(raw))
+                tok = jcs.loads(crypto.b64d(raw))
             except Exception:
                 return "bad poll token"
             if not isinstance(tok, dict):
@@ -383,7 +388,7 @@ def make_server(port: int, state: State):
                 if not envelope.safe_fp(fp):
                     return self._json(400, {"error": "bad node fingerprint"})
                 try:
-                    bundle = json.loads(b)
+                    bundle = jcs.loads(b)
                 except Exception:
                     return self._json(400, {"error": "bad json"})
                 # verify bundle is signed by the node key it names, and that
@@ -409,7 +414,7 @@ def make_server(port: int, state: State):
             if self.path == "/v1/register":
                 b = self._body()
                 try:
-                    reg = json.loads(b)
+                    reg = jcs.loads(b)
                 except Exception:
                     return self._json(400, {"error": "bad json"})
                 if not isinstance(reg, dict):
@@ -476,7 +481,7 @@ def make_server(port: int, state: State):
             if self.path == "/v1/msg":
                 b = self._body()
                 try:
-                    env = json.loads(b)
+                    env = jcs.loads(b)
                 except Exception:
                     return self._json(400, {"error": "bad json"})
                 if not env.get("msg_id") or not env.get("to"):
