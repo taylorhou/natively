@@ -5,6 +5,7 @@ Sessions are node-to-node (relays/hubs never see plaintext); agent identity
 and authority ride inside as signed envelopes + cards + grants. A node runs
 per machine; agents are local processes using the CLI.
 """
+import calendar
 import json
 import os
 import time
@@ -25,6 +26,14 @@ P = 5  # poll interval seconds (spec 4 sizing: ack_deadline 2P+jitter, retries 2
 # outbox forever (96 carried 24k such files on 2026-09-08). Deferrals
 # are terminal after this many seconds.
 DEFER_UNKNOWN_TTL = 1800
+
+# A pairwise envelope that will not decrypt waits - the sessions may be
+# mid-repair and the peer's next envelope can heal them. But a wedge like
+# air's 2026-09-08 flood (pre-repair ciphertexts under dead chains) never
+# heals, and an infinite failure class churns polls forever. Past this
+# many seconds (anchored on the envelope's signed ts) a decrypt failure
+# is terminal: ledgered, acked, dropped.
+DEFER_DECRYPT_TTL = 1800
 
 
 def home_dir() -> str:
@@ -399,17 +408,20 @@ class Node:
         self._save_session("to", peer_fp)
         return s, ek  # ek travels with first ciphertext
 
+    def _x3dh_responder_session(self, peer_fp, x3dh_ek_b64):
+        bundle = self._prekey_bundle(peer_fp)
+        peer_node_pub = crypto.b64d(bundle["node_key"].split(":", 1)[1])
+        root = crypto.x3dh_responder(self.node_seed, self.spk_sk,
+                                     crypto.ed_pk_to_x(peer_node_pub),
+                                     crypto.b64d(x3dh_ek_b64))
+        return crypto.DRSession.init_responder(root, self.spk_sk)
+
     def _session_for_recv(self, peer_fp, x3dh_ek_b64, dh_hdr):
         s = self._session("from", peer_fp)
         if s is None:
             if not x3dh_ek_b64:
                 raise ValueError("no session and no x3dh ek")
-            bundle = self._prekey_bundle(peer_fp)
-            peer_node_pub = crypto.b64d(bundle["node_key"].split(":", 1)[1])
-            root = crypto.x3dh_responder(self.node_seed, self.spk_sk,
-                                         crypto.ed_pk_to_x(peer_node_pub),
-                                         crypto.b64d(x3dh_ek_b64))
-            s = crypto.DRSession.init_responder(root, self.spk_sk)
+            s = self._x3dh_responder_session(peer_fp, x3dh_ek_b64)
             self.sessions["from:" + peer_fp] = s
         return s
 
@@ -435,6 +447,22 @@ class Node:
             # handshake that never decrypted anything leaves no session at
             # all, so the peer's next x3dh_ek can start one
             self.sessions.pop("from:" + peer_fp, None)
+            if wire.get("x3dh_ek"):
+                # Heal-on-handshake: a peer that has never seen an ack keeps
+                # re-attaching its x3dh ephemeral (hs_pending), but a
+                # diverged saved session on this side made us ignore the
+                # offer and fail forever - the air wedge of 2026-09-08. Try
+                # the offered handshake from scratch and commit the fresh
+                # session ONLY if it actually reads this envelope; a failed
+                # probe changes nothing.
+                s2 = self._x3dh_responder_session(peer_fp, wire["x3dh_ek"])
+                pt2 = s2.decrypt(wire["dh"], crypto.b64d(wire["ct"]), aad=b"nv1-msg")
+                self.sessions["from:" + peer_fp] = s2
+                self._save_session("from", peer_fp)
+                self.ledger.append("node:%s" % self.name, None, "session.heal",
+                                   {"peer": peer_fp}, "ok",
+                                   "adopted peer's re-attached x3dh handshake after decrypt failure")
+                return json.loads(pt2)
             raise
         self._save_session("from", peer_fp)
         return json.loads(pt)
@@ -757,14 +785,12 @@ class Node:
             except IdentityError:
                 fresh_fp = sender_fp
             if fresh_fp == sender_fp:
-                self.ledger.append("node:%s" % self.name, None, "msg.recv",
-                                   {"msg_id": env["msg_id"]}, _oclass(e), "decrypt failed: %s" % e)
+                self._decrypt_failed(env, agent_name, e)
                 return
             try:
                 body = self._dec_pairwise(fresh_fp, env["body"])
             except Exception as e2:
-                self.ledger.append("node:%s" % self.name, None, "msg.recv",
-                                   {"msg_id": env["msg_id"]}, _oclass(e2), "decrypt failed: %s" % e2)
+                self._decrypt_failed(env, agent_name, e2)
                 return
         kind = body.get("kind")
         if env.get("type") == "ack" and kind == "ack":
@@ -1044,6 +1070,43 @@ class Node:
                                "no v0 executor for action %s" % action, issuer_model=issuer_model)
             return "refused"
         return "information-only"
+
+    def _decrypt_failed(self, env, agent_name, err):
+        """A pairwise envelope this node cannot read right now. Ledger the
+        failure and leave it unacked while it is young: sessions mid-repair
+        can heal. Past DEFER_DECRYPT_TTL the failure is permanent - chains
+        do not heal backward and the sender's own retries are long
+        exhausted - so ack-and-drop: the sender and any app-level resend
+        loop watching for the ack stop, and the drop is on the record.
+        Age anchors on the envelope's signed ts, so a backlog predating
+        this code drains on first sight instead of after another TTL."""
+        now = time.time()
+        mid = env.get("msg_id")
+        reg = self.state.setdefault("dfail", {})
+        rec = reg.get(mid)
+        first = rec["first"] if rec else now
+        try:
+            ets = calendar.timegm(time.strptime(str(env.get("ts", "")),
+                                                "%Y-%m-%dT%H:%M:%SZ"))
+            if ets <= now + 60:
+                first = min(first, ets)
+        except (ValueError, TypeError, OverflowError):
+            pass
+        reg[mid] = {"first": first, "last": now, "err": _oclass(err)}
+        if len(reg) > 5000:  # bound the register: oldest-first entries out
+            for old_mid in sorted(reg, key=lambda m: reg[m]["first"])[:1000]:
+                reg.pop(old_mid, None)
+        if now - first <= DEFER_DECRYPT_TTL:
+            self.ledger.append("node:%s" % self.name, None, "msg.recv",
+                               {"msg_id": mid}, _oclass(err), "decrypt failed: %s" % err)
+            self._save_state()
+            return
+        reg.pop(mid, None)
+        self.ledger.append("agent:%s" % agent_name, None, "msg.recv",
+                           {"msg_id": mid}, "terminal",
+                           "undecryptable for >%ds: acked and dropped" % DEFER_DECRYPT_TTL)
+        self._save_state()
+        self._ack(env, agent_name)
 
     def _ack(self, env, agent_name):
         try:
