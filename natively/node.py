@@ -1692,10 +1692,29 @@ class Node:
         # sweep during the plane-test-1 soak, depth climbing the whole
         # time while the daemon looked "alive and clean".
         RETRY_BATCH = 100
+        # Two backlog governors on top of the batch cap, from the 2026-09-08
+        # post-wedge churn (96's unacked at ~60k and GROWING under live soak
+        # traffic): the sweep is sequential hub POSTs, so at deep backlog the
+        # per-step sweep time starves the poll side and acks arrive slower
+        # than production adds - the table climbs although every entry in it
+        # has a bounded lifetime. (1) Time-box the sweep: past the budget the
+        # remaining due entries wait for the next step, so polling (and ack
+        # intake) is never more than ~budget behind. (2) Depth-scaled
+        # backoff: while the table is deep, due times stretch by depth /
+        # BACKOFF_SCALE_DEPTH, so a 60k backlog retries each entry ~12x less
+        # often - the flood's shadow drains at ack speed instead of
+        # re-POSTing dead weight every few seconds.
+        RETRY_SWEEP_BUDGET_S = 2.0
+        BACKOFF_SCALE_DEPTH = 5000
+        depth = len(self.state["unacked"])
+        scale = max(1, depth // BACKOFF_SCALE_DEPTH)
+        deadline = now + RETRY_SWEEP_BUDGET_S
         due = sorted((rec["next"], mid) for mid, rec in self.state["unacked"].items()
                      if now >= rec["next"])
         dirty = False
         for _, mid in due[:RETRY_BATCH]:
+            if time.time() > deadline:
+                break
             rec = self.state["unacked"].get(mid)
             if rec is None:
                 continue
@@ -1709,7 +1728,7 @@ class Node:
                 continue
             try:
                 self._hub_req("POST", "/v1/msg", json.dumps(rec["env"]).encode())
-                rec["next"] = now + (2 ** rec["attempts"]) * P
+                rec["next"] = now + (2 ** rec["attempts"]) * P * scale
             except urllib.error.HTTPError as e:
                 if e.code == 409:
                     # the recipient moved after this ciphertext was made:
@@ -1719,11 +1738,11 @@ class Node:
                                        {"msg_id": mid}, "dead",
                                        "UNDELIVERED: recipient moved to another node: %s (surface to principal)" % mid)
                     continue
-                rec["next"] = now + (2 ** rec["attempts"]) * P
+                rec["next"] = now + (2 ** rec["attempts"]) * P * scale
                 self.ledger.append("node:%s" % self.name, None, "msg.retry",
                                    {"msg_id": mid}, _oclass(e), str(e))
             except Exception as e:
-                rec["next"] = now + (2 ** rec["attempts"]) * P
+                rec["next"] = now + (2 ** rec["attempts"]) * P * scale
         if dirty:
             self._save_state()
 
