@@ -48,7 +48,7 @@ def test_wire_msg_id_never_becomes_a_path(tmp_path, hub, principal):
     assert not os.path.exists(os.path.join(n2.home, "state.json.json"))
     assert "../../state" not in n2.state["seen"]
     # the receive ledger never names a malformed grant id either
-    env = _hostile_envelope(n1, "alpha", n2, "beta", envelope.new_id("msg"), {"kind": "text", "text": "y"}, grant_ids=[123, "x"])
+    env = _hostile_envelope(n1, "alpha", n2, "beta", envelope.new_id("msg"), {"kind": "text", "text": "y"}, grant_ids=["x", "grt_../"])
     assert http("POST", hub.url + "/v1/msg", env)[0] == 200
     pump([n2], 2)
     recv = [e for e in n2.ledger.entries() if e["action"] == "msg.recv" and e["outcome"] == "information-only"]

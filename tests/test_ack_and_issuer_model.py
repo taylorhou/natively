@@ -36,9 +36,11 @@ def test_ack_never_enters_retry_table(tmp_path, hub, principal):
 def test_late_ack_is_ledgered_not_dropped(tmp_path, hub, principal):
     n1 = make_node(tmp_path, "n1", hub.url, principal, {"alpha": ["msg.send"]})
     n2 = make_node(tmp_path, "n2", hub.url, principal, {"beta": ["msg.send"]})
-    # an ack for a msg_id n1 never sent (or already expunged)
+    # an ack for a msg_id n1 never sent (or already expunged); the id is
+    # well formed - an ack naming something that is not an identifier is
+    # rejected as malformed before the unacked table is consulted
     n2.queue_send("beta", agent_key(n1, "alpha"),
-                  {"kind": "ack", "ack": "msg_never-sent", "ledger_head": "x"},
+                  {"kind": "ack", "ack": "msg_" + "0" * 26, "ledger_head": "x"},
                   msg_type="ack")
     pump([n1, n2], 6)
     assert "late" in outcomes(n1, "msg.ack-late")

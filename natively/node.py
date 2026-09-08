@@ -741,7 +741,7 @@ class Node:
 
     # ---------- send path ----------
     def queue_send(self, from_agent, to_agent_key_b64, body_obj, grant_ids=None,
-                   inner_wire=None, msg_type="msg", to_node_fp=None, control=False):
+                   inner_wire=None, msg_type="msg", to_node_fp=None, control=False, in_reply_to=None):
         """Enqueue an outbound message. body_obj is plaintext JSON for pairwise
         (encrypted to recipient node); inner_wire carries pre-encrypted group
         payloads (node-encrypted wrapper only). control=True marks the envelope
@@ -750,7 +750,7 @@ class Node:
         a = self.agents[from_agent]
         req = {"from_agent": from_agent, "to": to_agent_key_b64,
                "body_obj": body_obj, "grant_ids": grant_ids or [],
-               "msg_type": msg_type, "queued_at": time.time()}
+               "msg_type": msg_type, "queued_at": time.time(), "in_reply_to": in_reply_to}
         if control:
             req["control"] = True
         if to_node_fp:
@@ -908,7 +908,7 @@ class Node:
                     extra["class"] = "control"
                 env = envelope.make_message(
                     a["card"]["agent_key"].split(":", 1)[1], req["to"].split(":", 1)[-1],
-                    ct_b64, a["seed"], grant_ids=req["grant_ids"],
+                    ct_b64, a["seed"], grant_ids=req["grant_ids"], in_reply_to=req.get("in_reply_to"),
                     msg_type=req["msg_type"], extra=extra)
                 try:
                     self._hub_req("POST", "/v1/msg", json.dumps(env).encode())
@@ -983,9 +983,15 @@ class Node:
 
     # ---------- receive path ----------
     def _handle_envelope(self, env):
-        if not envelope.safe_id(env.get("msg_id"), "msg"):
-            self.ledger.append("node:%s" % self.name, None, "msg.recv", {}, "rejected-bad-id",
-                               "msg_id is not an identifier")
+        """Every envelope, whatever its type, takes this one path: shape,
+        signature, local recipient, sender card, ONE decryption, then
+        dispatch on type - an ack to _handle_ack (bound to the message it
+        answers), everything else to the inbox and an ack back."""
+        err = envelope.check_message_shape(env)
+        if err:
+            self.ledger.append("node:%s" % self.name, None, "msg.recv",
+                               {"msg_id": env.get("msg_id") if envelope.safe_id(env.get("msg_id"), "msg") else None},
+                               "rejected-malformed", "envelope refused: %s" % err)
             return
         if not envelope.verify_message(env):
             self.ledger.append("node:%s" % self.name, None, "msg.recv",
@@ -1028,12 +1034,13 @@ class Node:
             except Exception as e2:
                 self._decrypt_failed(env, agent_name, e2)
                 return
-        kind = body.get("kind")
-        if env.get("type") == "ack" and kind == "ack":
-            # an ack read here (the preview in step() failed against the
-            # cached node and the sender was re-resolved) clears its
-            # message, it is never filed as a message of its own
-            self._handle_ack(env, body)
+            sender_fp = fresh_fp  # the node this ciphertext really came from
+        if not isinstance(body, dict):
+            self.ledger.append("node:%s" % self.name, None, "msg.recv",
+                               {"msg_id": env["msg_id"]}, "rejected-malformed", "body is not an object")
+            return
+        if env["type"] == "ack":
+            self._handle_ack(env, body, sender_fp)
             return
         self._deliver_local(agent_name, env, body)
         self._ack(env, agent_name)
@@ -1534,38 +1541,50 @@ class Node:
         try:
             sender_key = env["from"]
             body = {"kind": "ack", "ack": env["msg_id"], "ledger_head": self.ledger.head()}
-            self.queue_send(agent_name, sender_key, body, msg_type="ack")
+            self.queue_send(agent_name, sender_key, body, msg_type="ack", in_reply_to=env["msg_id"])
         except Exception as e:
             self.ledger.append("agent:%s" % agent_name, None, "ack.send",
                                {"msg_id": env["msg_id"]}, _oclass(e), str(e))
 
-    def _handle_ack(self, env, body):
+    def _handle_ack(self, env, body, sender_fp):
+        """An ack (already verified and decrypted) clears an outstanding
+        message only when it comes from the party that message was sent
+        to: the ack's from = the message's to, the ack's to = the
+        message's from, the sender's node = the node it was encrypted
+        for, and in_reply_to (when present) = the message id."""
         mid = body.get("ack")
-        if mid in self.state["unacked"]:
-            self.state["unacked"].pop(mid)
-            self._save_state()
-            try:
-                _, peer_fp = self._peer_card(env["from"])
-            except IdentityError:
-                peer_fp = None
-            if peer_fp:
-                s = self._session("to", peer_fp)
-                if s and s.hs_pending:
-                    s.hs_pending = False
-                    s.x3dh_ek = None
-                    self._save_session("to", peer_fp)
+        if body.get("kind") != "ack" or not envelope.safe_id(mid, "msg"):
             self.ledger.append("node:%s" % self.name, None, "msg.ack",
-                               {"msg_id": mid, "peer_head": body.get("ledger_head")}, "ok",
-                               "acked %s" % mid)
-            return True
-        # A late ack met an empty unacked slot: the entry already
-        # dead-lettered or was never ours. Ledger it so "peer never
-        # answered" stays distinguishable from "answer arrived past the
-        # deadline" when two ledgers are compared.
-        self.ledger.append("node:%s" % self.name, None, "msg.ack-late",
-                           {"msg_id": mid, "peer_head": body.get("ledger_head")}, "late",
-                           "ack arrived with no unacked entry: %s" % mid)
-        return False
+                               {"msg_id": env["msg_id"]}, "rejected-malformed", "ack envelope without an ack body")
+            return False
+        rec = self.state["unacked"].get(mid)
+        if rec is None:
+            # A late ack met an empty unacked slot: the entry already
+            # dead-lettered or was never ours. Ledger it (#48) so "peer never
+            # answered" stays distinguishable from "answer arrived past the
+            # deadline" when two ledgers are compared.
+            self.ledger.append("node:%s" % self.name, None, "msg.ack-late",
+                               {"msg_id": mid, "peer_head": body.get("ledger_head")}, "late",
+                               "ack arrived with no unacked entry: %s" % mid)
+            return False
+        orig = rec["env"]
+        if (orig["to"] != env["from"] or orig["from"] != env["to"] or rec.get("peer_fp") != sender_fp
+                or (env.get("in_reply_to") is not None and env["in_reply_to"] != mid)):
+            self.ledger.append("node:%s" % self.name, None, "msg.ack",
+                               {"msg_id": mid, "from": env["from"]}, "rejected-wrong-party",
+                               "ack for %s from a party it was not sent to" % mid)
+            return False
+        self.state["unacked"].pop(mid)
+        self._save_state()
+        s = self._session("to", sender_fp)
+        if s and s.hs_pending:
+            s.hs_pending = False
+            s.x3dh_ek = None
+            self._save_session("to", sender_fp)
+        self.ledger.append("node:%s" % self.name, None, "msg.ack",
+                           {"msg_id": mid, "peer_head": body.get("ledger_head")}, "ok",
+                           "acked %s" % mid)
+        return True
 
     # ---------- retry engine (spec 4: retries at 2P, 4P, 8P) ----------
     def _retries(self):
@@ -1670,8 +1689,17 @@ class Node:
                                  headers={"X-Natively-Auth": self._auth_token("poll", after=after)})
             d = json.loads(b)
             for item in d.get("messages", []):
+                if not isinstance(item, dict):
+                    self.ledger.append("node:%s" % self.name, None, "msg.recv", {}, "rejected-malformed",
+                                       "poll row is not an object")
+                    continue
                 env = item.get("env", item)  # tolerate legacy unwrapped rows
-                seq = item.get("_seq", 0)
+                seq = item.get("_seq", 0) if isinstance(item.get("_seq", 0), int) else 0
+                if not isinstance(env, dict):
+                    self.ledger.append("node:%s" % self.name, None, "msg.recv", {"seq": seq}, "rejected-malformed",
+                                       "envelope is not an object")
+                    self.state["last_seq"] = max(self.state["last_seq"], seq)
+                    continue
                 mid = env.get("msg_id")
                 if not envelope.safe_id(mid, "msg"):
                     # a wire msg_id names the inbox file and the seen set:
@@ -1686,29 +1714,13 @@ class Node:
                 self.state["seen"].append(mid)
                 if len(self.state["seen"]) > 5000:
                     self.state["seen"] = self.state["seen"][-5000:]
-                body_preview = None
-                if env.get("type") == "ack":
-                    try:
-                        _, sender_fp = self._peer_card(env["from"])
-                        body_preview = self._dec_pairwise(sender_fp, env["body"])
-                    except Exception:
-                        body_preview = None
-                    try:
-                        if body_preview and body_preview.get("kind") == "ack":
-                            self._handle_ack(env, body_preview)
-                        else:
-                            self._handle_envelope(env)
-                    except Exception as e:
-                        # per-envelope boundary (#16): one poison message
-                        # must never kill the loop or block the queue
-                        self.ledger.append("node:%s" % self.name, None, "msg.recv",
-                                           {"msg_id": mid}, _oclass(e), "handle failed: %s" % e)
-                else:
-                    try:
-                        self._handle_envelope(env)
-                    except Exception as e:
-                        self.ledger.append("node:%s" % self.name, None, "msg.recv",
-                                           {"msg_id": mid}, _oclass(e), "handle failed: %s" % e)
+                try:
+                    self._handle_envelope(env)
+                except Exception as e:
+                    # per-envelope boundary (#16): one poison message
+                    # must never kill the loop or block the queue
+                    self.ledger.append("node:%s" % self.name, None, "msg.recv",
+                                       {"msg_id": mid}, _oclass(e), "handle failed: %s" % e)
                 self.state["last_seq"] = max(self.state["last_seq"], seq)
             self._save_state()
         except (urllib.error.URLError, OSError) as e:
