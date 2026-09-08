@@ -221,9 +221,10 @@ def test_a_failure_after_execution_never_runs_the_action_again(tmp_path, hub, pr
             raise OSError("disk full")  # after the action ran, before the inbox record
         return real_w600(path, data)
 
-    monkeypatch.setattr(nodemod, "_w600", disk_full)
+    monkeypatch.setattr(nodemod, "_w600_sync", disk_full)
     n2.step()
     assert outcomes(n2, "test.ping") == ["ok"]  # it ran once
+    assert inbox(n2, "beta") == [] and any(o.startswith("error") for o in outcomes(n2, "msg.recv", classified=True))  # the injected failure happened
     assert mid in n2.state["seen"]  # and stays seen: not the deferred class
     monkeypatch.setattr(nodemod, "_w600", real_w600)
     env = n1.state["unacked"][mid]["env"]

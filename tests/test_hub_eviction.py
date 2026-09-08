@@ -1,11 +1,11 @@
-"""Hub queue eviction is kind-aware, and dedupe skips are honestly
-accounted (plane-test-1 soak: group_key distributions evicted by chatter
-floods from capped queues; re-POSTs of known msg_ids returning
-{"queued": 1} made 'hub accepted' evidence worthless)."""
+"""Hub queue bounds are backpressure, not eviction (review 2026-09-07,
+point 7): a queue at its quota refuses the next POST with 429 and nothing
+accepted is discarded - the control envelope queued first survives any
+chatter flood (plane-test-1 soak: group_key distributions evicted by relay
+firehoses from capped queues); dedupe skips are honestly accounted."""
 import json
 
 from natively import envelope
-from natively.hub import _evict_to_cap
 
 from conftest import http, make_node
 
@@ -17,35 +17,21 @@ def _fake_env(agent_key, cls=None):
     return e
 
 
-def test_evict_helper_prefers_data():
-    q = [{"_class": "data", "i": i} for i in range(4)] + [{"_class": "control", "i": "c%d" % i} for i in range(3)]
-    kept, dropped = _evict_to_cap(q, 5)
-    assert len(kept) == 5 and len(dropped) == 2
-    assert all(m["_class"] == "control" for m in kept[2:])  # all control survives
-    assert [m["i"] for m in dropped] == [0, 1]  # oldest data first
-
-
-def test_evict_helper_all_control_overflow():
-    q = [{"_class": "control", "i": i} for i in range(7)]
-    kept, dropped = _evict_to_cap(q, 5)
-    assert [m["i"] for m in kept] == [2, 3, 4, 5, 6]  # bounded: oldest control goes
-
-
-def test_control_survives_data_flood(tmp_path, hub, principal):
+def test_control_survives_data_flood_and_the_flood_is_refused_not_evicted(tmp_path, hub, principal):
     n1 = make_node(tmp_path, "n1", hub.url, principal, {"alpha": ["msg.send"]})
     n2 = make_node(tmp_path, "n2", hub.url, principal, {"beta": ["msg.send"]})
     to = n2.agents["beta"]["card"]["agent_key"]
     ctl = _fake_env(to, "control")
     assert http("POST", hub.url + "/v1/msg", ctl)[0] == 200
-    for _ in range(510):
-        assert http("POST", hub.url + "/v1/msg", _fake_env(to))[0] == 200
-    # poll n2's queue raw: the control envelope must still be there
+    statuses = [http("POST", hub.url + "/v1/msg", _fake_env(to))[0] for _ in range(510)]
+    cap = hub.state.QUEUE_MAX_MSGS
+    assert statuses[:cap - 1] == [200] * (cap - 1) and statuses[cap - 1:] == [429] * (510 - cap + 1)
+    # poll n2's queue raw: everything accepted is there, the control envelope first of all
     tok = n2._auth_token("poll", after=0)
     st, d = http("GET", hub.url + "/v1/poll/%s?after=0" % n2.fp, headers={"X-Natively-Auth": tok})
     assert st == 200
     ids = [it.get("env", it).get("msg_id") for it in d["messages"]]
-    assert ctl["msg_id"] in ids
-    assert len(d["messages"]) == 500
+    assert ctl["msg_id"] in ids and len(d["messages"]) == cap
 
 
 def test_dedupe_is_honestly_accounted(tmp_path, hub, principal):
