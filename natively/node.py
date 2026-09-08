@@ -354,6 +354,20 @@ class Node:
         wire = {"kind": "group_msg", "group_id": gid, "n": n, "ct": crypto.b64e(ct),
                 "sender_fp": self.fp}
         for m in g["members"]:
+            # Skip members whose card fails verification against the pinned
+            # root set (retired principal, stale group file): queueing to
+            # them only manufactures permanently-undeliverable outbox
+            # entries. IdentityUnknown (not yet registered) still queues -
+            # the recipient may simply not have registered yet.
+            try:
+                self._peer_card(m["agent_key"])
+            except IdentityUnknown:
+                pass
+            except IdentityError as e:
+                self.ledger.append("agent:%s" % from_agent, None, "group.send",
+                                   {"group_id": gid, "member": m["agent_key"]},
+                                   "member-skipped", "member skipped: %s" % e)
+                continue
             self.queue_send(from_agent, m["agent_key"], {
                 "kind": "group_relay", "wire": wire, "group_id": gid,
             }, inner_wire=wire)
@@ -396,6 +410,7 @@ class Node:
                                {}, "retry", "register failed: %s" % e)
 
     def _flush_outbox(self):
+        dead = {}  # recipient -> permanent identity verdict, this pass
         for i, f in enumerate(sorted(os.listdir(self.outbox_dir))):
             if i and i % 200 == 0:
                 self._maybe_reregister()
@@ -404,6 +419,16 @@ class Node:
             path = os.path.join(self.outbox_dir, f)
             try:
                 req = json.load(open(path))
+                if req["to"] in dead:
+                    # a recipient already found permanently undeliverable in
+                    # this pass (e.g. card principal not in the pinned root
+                    # set): the verdict is deterministic, so every queued
+                    # envelope to it is dead on arrival. Mark without
+                    # re-resolving - a dead-fanout backlog drains in one pass.
+                    self.ledger.append("node:%s" % self.name, None, "msg.send", {"file": f},
+                                       "error", "send failed: recipient identity: %s (same-pass verdict)" % dead[req["to"]])
+                    os.rename(path, path + ".err")
+                    continue
                 if req["from_agent"] not in self._last_registered:
                     # an agent added since the last successful registration:
                     # peers refuse (and consume) a message from a sender the
@@ -418,6 +443,7 @@ class Node:
                 except IdentityUnknown:
                     raise
                 except IdentityError as e:
+                    dead[req["to"]] = str(e)
                     raise ValueError("recipient identity: %s" % e)
                 if peer_fp == self.fp:
                     # loopback: recipient agent is local - deliver in place;
