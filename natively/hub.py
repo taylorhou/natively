@@ -130,8 +130,36 @@ class State:
                 self.queues[fp], _ = _evict_to_cap(q, 500)
             for fp, q in self.queues.items():
                 self.qids[fp] = {m.get("env", {}).get("msg_id") for m in q}
+            self._prune_directory()
         except Exception as e:
             print("hub: state load failed, starting empty:", e)
+
+    def _prune_directory(self):
+        """Persisted directory entries must still be registerable today:
+        drop cards whose principal is outside this hub's root set (they
+        registered before the allowlist existed) and cards past expiry.
+        Node/prekey entries orphaned by the prune go too. Queues are left
+        alone: senders re-POST unacked envelopes."""
+        now = envelope.now_iso()
+        dead = {}
+        for name, e in self.agent_dir.items():
+            card = e.get("card") or {}
+            ref = _key_b64(card.get("principal_key_ref"))
+            exp = card.get("expires_at")
+            bad_root = bool(self.principal_roots) and ref not in self.principal_roots
+            expired = isinstance(exp, str) and exp < now
+            if bad_root or expired:
+                dead[name] = e.get("node_fp")
+        for name, fp in dead.items():
+            e = self.agent_dir.pop(name, None)
+            if e:
+                self.agent_owner.pop(_key_b64(e.get("agent_key")), None)
+        for fp in {fp for fp in dead.values() if fp}:
+            if not any(v.get("node_fp") == fp for v in self.agent_dir.values()):
+                self.nodes.pop(fp, None)
+                self.prekeys.pop(fp, None)
+        if dead:
+            print("hub: pruned %d stale directory entries on load" % len(dead))
 
     BLOB_CAP = 64 * 1024 * 1024
     SAVE_INTERVAL = 2.0
