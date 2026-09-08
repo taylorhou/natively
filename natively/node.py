@@ -838,13 +838,26 @@ class Node:
     # ---------- retry engine (spec 4: retries at 2P, 4P, 8P) ----------
     def _retries(self):
         now = time.time()
-        for mid, rec in list(self.state["unacked"].items()):
-            if now < rec["next"]:
+        # Cap due retries per sweep and save state once at the end. The
+        # sweep is sequential hub calls: an unacked backlog (dead peer,
+        # hub outage) otherwise starves the flush and poll sides behind
+        # minutes of retry POSTs - the same pathology FLUSH_BATCH caps on
+        # the send side, and each dead-letter also rewrote the whole state
+        # file. Break: 96's flush went dark ~20 min behind a ~27k unacked
+        # sweep during the plane-test-1 soak, depth climbing the whole
+        # time while the daemon looked "alive and clean".
+        RETRY_BATCH = 100
+        due = sorted((rec["next"], mid) for mid, rec in self.state["unacked"].items()
+                     if now >= rec["next"])
+        dirty = False
+        for _, mid in due[:RETRY_BATCH]:
+            rec = self.state["unacked"].get(mid)
+            if rec is None:
                 continue
             rec["attempts"] += 1
+            dirty = True
             if rec["attempts"] > 3:
                 self.state["unacked"].pop(mid)
-                self._save_state()
                 self.ledger.append("node:%s" % self.name, None, "msg.undelivered",
                                    {"msg_id": mid}, "dead",
                                    "UNDELIVERED after 3 retries: %s (surface to principal)" % mid)
@@ -857,7 +870,6 @@ class Node:
                     # the recipient moved after this ciphertext was made:
                     # it can never be read where it is routed now
                     self.state["unacked"].pop(mid)
-                    self._save_state()
                     self.ledger.append("node:%s" % self.name, None, "msg.undelivered",
                                        {"msg_id": mid}, "dead",
                                        "UNDELIVERED: recipient moved to another node: %s (surface to principal)" % mid)
@@ -867,9 +879,8 @@ class Node:
                                    {"msg_id": mid}, "error", str(e))
             except Exception as e:
                 rec["next"] = now + (2 ** rec["attempts"]) * P
-                self.ledger.append("node:%s" % self.name, None, "msg.retry",
-                                   {"msg_id": mid}, "error", str(e))
-        self._save_state()
+        if dirty:
+            self._save_state()
 
     # ---------- main loop ----------
     def run(self, once=False):
