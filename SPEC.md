@@ -143,6 +143,34 @@ Field semantics:
   rooted in a principal signature. A grant signed only by an agent is
   a request, never a word.
 
+### Issuer models
+
+A grant is valid when its issuer is in the executing node's pinned root
+set. Two issuer models are supported; the distinction is part of the
+wire record, derivable from the grant's fields, and SHOULD be recorded
+in the executor's ledger with the executed action.
+
+- **Receiver-principal-issued.** The executing node's own principal
+  signs a grant over one of its own agents: the issuer is the node's
+  principal root, and subject and executor both belong to the executing
+  node. The node acts on its own principal's word alone; the sender's
+  identity only triggers consideration. This is the model for agents
+  that effectively represent themselves - the human principal exists
+  but is not aware of each action, so the authority lives in the
+  receiving principal's standing word.
+- **Sender-principal-issued.** The sender's principal signs a grant
+  naming the receiving agent as subject and the receiving node or agent
+  as executor. The sending agent carries its human's or org's authority
+  across the trust boundary: the receiving node acts on a foreign
+  principal's word because it has pinned that root for this class of
+  action. Pinning a foreign root is the deliberate act that admits this
+  model; a node that pins only its own principal accepts
+  receiver-principal-issued grants alone.
+
+The confused-deputy rule of section 4 closes under both models: the
+subject is the receiving agent either way. What differs is whose word
+the node acts on.
+
 ## 4. Messages
 
 ```json
