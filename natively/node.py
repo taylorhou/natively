@@ -443,7 +443,7 @@ class Node:
                 "kind": "group_key", "group_id": gid, "group_name": name,
                 "sender_fp": self.fp, "state": g["_send"].state(),
                 "members": members,
-            })
+            }, control=True)
         return gid
 
     def group_send(self, from_agent, gid, body_obj):
@@ -491,14 +491,18 @@ class Node:
 
     # ---------- send path ----------
     def queue_send(self, from_agent, to_agent_key_b64, body_obj, grant_ids=None,
-                   inner_wire=None, msg_type="msg", to_node_fp=None):
+                   inner_wire=None, msg_type="msg", to_node_fp=None, control=False):
         """Enqueue an outbound message. body_obj is plaintext JSON for pairwise
         (encrypted to recipient node); inner_wire carries pre-encrypted group
-        payloads (node-encrypted wrapper only)."""
+        payloads (node-encrypted wrapper only). control=True marks the envelope
+        class=control (signed): the hub never evicts those under chatter
+        pressure - use for group_key distributions and protocol control."""
         a = self.agents[from_agent]
         req = {"from_agent": from_agent, "to": to_agent_key_b64,
                "body_obj": body_obj, "grant_ids": grant_ids or [],
                "msg_type": msg_type, "queued_at": time.time()}
+        if control:
+            req["control"] = True
         if to_node_fp:
             req["to_node_fp"] = to_node_fp
         fn = os.path.join(self.outbox_dir, envelope.new_id("out") + ".json")
@@ -624,11 +628,14 @@ class Node:
                 # (409) when the recipient now lives elsewhere, so a card
                 # cached across a move never strands a message on the
                 # wrong node; the sender refreshes and re-encrypts.
+                extra = {"to": req["to"] if req["to"].startswith("ed25519:") else "ed25519:" + req["to"],
+                         "to_node": peer_fp}
+                if req.get("control"):
+                    extra["class"] = "control"
                 env = envelope.make_message(
                     a["card"]["agent_key"].split(":", 1)[1], req["to"].split(":", 1)[-1],
                     ct_b64, a["seed"], grant_ids=req["grant_ids"],
-                    msg_type=req["msg_type"], extra={"to": req["to"] if req["to"].startswith("ed25519:") else "ed25519:" + req["to"],
-                                                     "to_node": peer_fp})
+                    msg_type=req["msg_type"], extra=extra)
                 try:
                     self._hub_req("POST", "/v1/msg", json.dumps(env).encode())
                 except urllib.error.HTTPError as e:
@@ -791,7 +798,7 @@ class Node:
                     "kind": "group_key", "group_id": gid, "group_name": g.get("name", ""),
                     "sender_fp": self.fp, "state": g["_send"].state(),
                     "members": g.get("members", []),
-                })
+                }, control=True)
         if ack:
             self._ack(env, agent_name)
 
