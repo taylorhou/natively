@@ -892,10 +892,30 @@ class Node:
                 self.ledger.append("agent:%s" % agent_name, gid, "grant.check", {}, "wrong-subject",
                                    "grant subject is not the receiving agent - information only")
                 continue
+            # audience.executor (spec 3): a grant is valid only for the
+            # named executing node or agent; presented anywhere else it is
+            # invalid. Accept the prefixed or bare key form.
+            ek = str(g.get("audience", {}).get("executor", "")).split(":")[-1]
+            valid_exec = {crypto.b64e(self.node_pub)}
+            valid_exec |= {a["card"]["agent_key"].split(":", 1)[-1]
+                           for a in self.agents.values()}
+            if ek not in valid_exec:
+                self.ledger.append("agent:%s" % agent_name, gid, "grant.check", {},
+                                   "wrong-executor", "grant audience names a different executor")
+                continue
             action = body.get("action")
             resource = body.get("resource", "")
             params = body.get("params", {})
-            if not envelope.grant_covers(g, action, resource, params):
+            try:
+                covers = envelope.grant_covers(g, action, resource, params)
+            except Exception as e:
+                # a validly-signed but malformed grant is ledgered invalid,
+                # never a handler crash (the exchange failure class of
+                # 2026-09-08, mirrored on both implementations)
+                self.ledger.append("agent:%s" % agent_name, gid, "grant.check",
+                                   {"action": action}, "invalid", str(e))
+                continue
+            if not covers:
                 self.ledger.append("agent:%s" % agent_name, gid, "grant.check",
                                    {"action": action}, "out-of-scope", "refused")
                 continue

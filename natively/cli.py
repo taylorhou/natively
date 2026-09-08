@@ -206,9 +206,12 @@ def cmd_grant_issue(args):
     pseed = _principal_seed(args.principal)
     card = json.load(open(os.path.join(n.home, "agents", args.agent + ".card.json")))
     scope = json.loads(open(args.scope).read()) if os.path.exists(args.scope) else json.loads(args.scope)
-    g = envelope.make_grant(pseed, args.principal_name, card,
-                            "ed25519:" + crypto.b64e(n.node_pub), scope, args.statement,
-                            max_uses=args.max_uses, ttl_s=args.ttl)
+    try:
+        g = envelope.make_grant(pseed, args.principal_name, card,
+                                "ed25519:" + crypto.b64e(n.node_pub), scope, args.statement,
+                                max_uses=args.max_uses, ttl_s=args.ttl)
+    except ValueError as e:
+        raise SystemExit("grant not signed: %s" % e)
     gdir = os.path.join(n.home, "grants")
     os.makedirs(gdir, exist_ok=True)
     json.dump(g, open(os.path.join(gdir, g["grant_id"] + ".json"), "w"), indent=2)

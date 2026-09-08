@@ -122,6 +122,9 @@ def make_grant(principal_seed: bytes, principal_name: str, subject_card: dict,
                executor_key_b64: str, scope: list, statement: str,
                max_uses: int = 1, ttl_s: int = 86400,
                revocation_ledger: str = "", parent_grant: str = None) -> dict:
+    err = validate_scope(scope)
+    if err:
+        raise ValueError("refusing to sign a grant with malformed scope: %s" % err)
     g = {
         "grant_id": new_id("grt"),
         "issuer": {"principal": principal_name,
@@ -162,9 +165,33 @@ def verify_grant(grant: dict, pinned_principal_pub_b64: str = None) -> None:
         raise GrantError("grant must carry max_uses XOR per-scope max_uses_per_window")
 
 
+def validate_scope(scope) -> str:
+    """None when scope has the SPEC 3 shape - a non-empty list of
+    {action, resource, params} entries - else a human-readable error.
+    A malformed scope signs fine and then crashes or confuses every
+    executor down the line (2026-09-08 Citadel exchange: a dict-shaped
+    scope killed the receiver's grant check mid-ping)."""
+    if not isinstance(scope, list) or not scope:
+        return "scope must be a non-empty list of {action, resource, params} entries"
+    for i, sc in enumerate(scope):
+        if not isinstance(sc, dict):
+            return "scope[%d] is not an object" % i
+        if not isinstance(sc.get("action"), str) or not sc["action"]:
+            return "scope[%d].action must be a non-empty string" % i
+        if "resource" in sc and not isinstance(sc["resource"], str):
+            return "scope[%d].resource must be a string" % i
+        if "params" in sc and not isinstance(sc["params"], dict):
+            return "scope[%d].params must be an object" % i
+    return None
+
+
 def grant_covers(grant: dict, action: str, resource: str, params: dict) -> bool:
     """Does a scope entry cover this action/resource/params? v0 constraint
-    grammar: in / range / regex (spec 3)."""
+    grammar: in / range / regex (spec 3). Raises GrantError on a malformed
+    scope so executors ledger it instead of dying on a TypeError."""
+    err = validate_scope(grant.get("scope"))
+    if err:
+        raise GrantError("malformed scope: %s" % err)
     for sc in grant["scope"]:
         if sc["action"] != action:
             continue
