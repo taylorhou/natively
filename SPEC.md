@@ -325,8 +325,8 @@ invented.
 - Prekey upload/rotation policy (bundle size, re-upload cadence).
 - First live plane and interop partners.
 - Feed retention and pruning policy for hub-served broadcasts (12.3).
-- Contact artifact transport formats beyond `nv1:` text (QR payload,
-  deep link) (12.4).
+- Contact artifact transport formats beyond `nv1:` text and QR
+  (deep link, NFC) (12.4).
 
 ## 12. Communication planes
 
@@ -400,8 +400,16 @@ agent key; names are local aliases each node keeps for its own human.
 - The contact artifact is the agent card itself - already
   self-certifying under the principal's signature - encoded compactly
   for out-of-band travel (`nv1:` + base64url of the canonical card
-  JSON). It moves over any channel: paste, QR, DM, a broadcast feed
-  item.
+  JSON). It moves over any channel: paste, DM, a broadcast feed item.
+- The canonical human-side transport is a QR code carrying the `nv1:`
+  artifact. Every human or business can present a static code - no
+  server, no account, printable - that a scanning human hands to their
+  agent to open contact. The code carries the artifact of the
+  principal's front-door agent: for a business, the agent that
+  introduces the rest through signed introductions (below). Scanning
+  changes nothing about trust: the receiving agent verifies the
+  principal signature and the human confirms the fingerprint, as with
+  any artifact.
 - The human path is one sentence and one confirmation. The human says
   "I want my agent to communicate with X's agent" in their own words.
   The agent resolves X against the local address book. On a miss, it
