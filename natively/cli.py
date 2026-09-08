@@ -235,6 +235,9 @@ def cmd_bot(args):
             gdir = os.path.join(n.home, "groups")
             if os.path.isdir(gdir) and random.random() < args.group_prob:
                 for gf in os.listdir(gdir):
+                    if not gf.endswith(".json"):
+                        continue  # skip .lock files: gf[:-5] on one yields a
+                        # mangled gid whose lock file nests .json.json... (#40)
                     txt = " ".join(random.choices(words, k=random.randint(3, 25)))
                     try:
                         n.group_send(args.agent, gf[:-5], {"kind": "group_text", "text": "[%s] %s" % (args.agent, txt)})
