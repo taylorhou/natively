@@ -43,3 +43,32 @@ def test_group_send_to_unregistered_local_member_still_queues(tmp_path, hub, pri
     pump([n1, n2], 6)
     assert [r["body"]["text"] for r in inbox(n2, "gamma")
             if r["body"].get("kind") == "group_text"] == ["hi"]
+
+
+def test_group_key_superset_members_list_is_adopted(tmp_path, hub, principal):
+    # member-add via redistribution: a group_key carrying a strict superset
+    # of the local member list updates it; a shrink is ignored.
+    n1 = make_node(tmp_path, "n1", hub.url, principal, {"alpha": ["msg.send"]})
+    n2 = make_node(tmp_path, "n2", hub.url, principal, {"beta": ["msg.send"]})
+    n3 = make_node(tmp_path, "n3", hub.url, principal, {"gamma": ["msg.send"]})
+    two = [{"agent_key": agent_key(n1, "alpha")}, {"agent_key": agent_key(n2, "beta")}]
+    gid = n1.create_group("alpha", two, name="t")
+    pump([n1, n2], 4)
+    assert len(n2._group(gid)["members"]) == 2
+    # n1 adds n3 locally and redistributes the three-member list
+    three = two + [{"agent_key": agent_key(n3, "gamma")}]
+    g1 = n1._group(gid)
+    g1["members"] = three
+    n1._save_group(gid)
+    n1.queue_send("alpha", agent_key(n2, "beta"), {
+        "kind": "group_key", "group_id": gid, "group_name": "t",
+        "sender_fp": n1.fp, "state": g1["_send"].state(), "members": three})
+    pump([n1, n2], 4)
+    assert {m["agent_key"] for m in n2._group(gid)["members"]} == {m["agent_key"] for m in three}
+    assert "updated" in outcomes(n2, "group.members")
+    # a stale two-member redistribution must NOT shrink the list back
+    n1.queue_send("alpha", agent_key(n2, "beta"), {
+        "kind": "group_key", "group_id": gid, "group_name": "t",
+        "sender_fp": n1.fp, "state": g1["_send"].state(), "members": two})
+    pump([n1, n2], 4)
+    assert len(n2._group(gid)["members"]) == 3
