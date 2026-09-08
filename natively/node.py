@@ -649,9 +649,15 @@ class Node:
                         self._dir_cache = (0.0, None)
                         raise IdentityUnknown("recipient unknown to the hub")
                     raise
-                self.state["unacked"][env["msg_id"]] = {
-                    "env": env, "attempts": 1, "next": time.time() + 2 * P,
-                    "peer_fp": peer_fp}
+                # Acks never enter the retry table: an ack is an answer, not
+                # a message - nobody acks an ack, so every ack entered here
+                # retries 3x and dead-letters as a false UNDELIVERED (the
+                # 2026-09-08 exchange failure class, mirrored on both
+                # implementations).
+                if env.get("type") != "ack":
+                    self.state["unacked"][env["msg_id"]] = {
+                        "env": env, "attempts": 1, "next": time.time() + 2 * P,
+                        "peer_fp": peer_fp}
                 dirty = True  # saved once at pass end; a crash costs at most a duplicate send, and apply is idempotent on msg_id
                 self.ledger.append("agent:%s" % req["from_agent"], req["grant_ids"][0] if req["grant_ids"] else None,
                                    "msg.send", {"to": req["to"], "msg_id": env["msg_id"]}, "queued",
@@ -892,6 +898,14 @@ class Node:
                 self.ledger.append("agent:%s" % agent_name, gid, "grant.check", {}, "wrong-subject",
                                    "grant subject is not the receiving agent - information only")
                 continue
+            # Issuer model (spec 3): derivable once the subject card is
+            # bound - receiver-principal iff the grant issuer also signs
+            # the receiving agent's card, i.e. IS the executing node's own
+            # principal; anything else is a foreign (sender-side) root.
+            issuer_model = ("receiver-principal"
+                            if g["issuer"]["key"].split(":", 1)[-1]
+                            == subj_card[1]["card"].get("principal_key_ref", "").split(":", 1)[-1]
+                            else "sender-principal")
             # audience.executor (spec 3): a grant is valid only for the
             # named executing node or agent; presented anywhere else it is
             # invalid. Accept the prefixed or bare key form.
@@ -901,7 +915,8 @@ class Node:
                            for a in self.agents.values()}
             if ek not in valid_exec:
                 self.ledger.append("agent:%s" % agent_name, gid, "grant.check", {},
-                                   "wrong-executor", "grant audience names a different executor")
+                                   "wrong-executor", "grant audience names a different executor",
+                                   issuer_model=issuer_model)
                 continue
             action = body.get("action")
             resource = body.get("resource", "")
@@ -913,25 +928,28 @@ class Node:
                 # never a handler crash (the exchange failure class of
                 # 2026-09-08, mirrored on both implementations)
                 self.ledger.append("agent:%s" % agent_name, gid, "grant.check",
-                                   {"action": action}, "invalid", str(e))
+                                   {"action": action}, "invalid", str(e), issuer_model=issuer_model)
                 continue
             if not covers:
                 self.ledger.append("agent:%s" % agent_name, gid, "grant.check",
-                                   {"action": action}, "out-of-scope", "refused")
+                                   {"action": action}, "out-of-scope", "refused",
+                                   issuer_model=issuer_model)
                 continue
             uses = self.state["grant_uses"].get(gid, 0)
             if "max_uses" in g and uses >= g["max_uses"]:
-                self.ledger.append("agent:%s" % agent_name, gid, "grant.check", {}, "exhausted", "max_uses reached")
+                self.ledger.append("agent:%s" % agent_name, gid, "grant.check", {}, "exhausted", "max_uses reached",
+                                   issuer_model=issuer_model)
                 continue
             if action == "test.ping":
                 self.state["grant_uses"][gid] = uses + 1
                 self._save_state()
                 self.ledger.append("agent:%s" % agent_name, gid, "test.ping", params, "ok",
-                                   "pong (%d/%s)" % (uses + 1, g.get("max_uses", "-")))
+                                   "pong (%d/%s)" % (uses + 1, g.get("max_uses", "-")),
+                                   issuer_model=issuer_model)
                 acted = "acted:test.ping"
             else:
                 self.ledger.append("agent:%s" % agent_name, gid, action, params, "unsupported",
-                                   "no v0 executor for action %s" % action)
+                                   "no v0 executor for action %s" % action, issuer_model=issuer_model)
         return acted
 
     def _ack(self, env, agent_name):
@@ -962,6 +980,13 @@ class Node:
                                {"msg_id": mid, "peer_head": body.get("ledger_head")}, "ok",
                                "acked %s" % mid)
             return True
+        # A late ack met an empty unacked slot: the entry already
+        # dead-lettered or was never ours. Ledger it so "peer never
+        # answered" stays distinguishable from "answer arrived past the
+        # deadline" when two ledgers are compared.
+        self.ledger.append("node:%s" % self.name, None, "msg.ack-late",
+                           {"msg_id": mid, "peer_head": body.get("ledger_head")}, "late",
+                           "ack arrived with no unacked entry: %s" % mid)
         return False
 
     # ---------- retry engine (spec 4: retries at 2P, 4P, 8P) ----------

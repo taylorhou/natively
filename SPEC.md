@@ -114,11 +114,16 @@ canonical form of the envelope minus the `sig` field.
 Field semantics:
 
 - **scope** entries name an action and a resource narrowly. The
-  resource is bound to a host identity (`host:<node-key>:...`), never
-  to a bare label, so a grant cannot be replayed against a different
-  machine that happens to carry the same file. `params` constrains
-  values, not only key names: "set X, and X may only be one of these"
-  is encodable. The v0 constraint grammar is `in` / `range` / `regex`.
+  resource is an opaque label, matched literally. When the resource is
+  a thing that lives on a host it SHOULD be host-bound
+  (`host:<node-key>:...`); bare labels and the empty string are legal,
+  and `""` is the form for actions that take no resource (e.g.
+  `test.ping`). Replay protection does not come from the resource
+  shape: **audience.executor** below already makes a grant presented to
+  a different node or agent invalid, so a bare resource cannot carry a
+  grant across machines. `params` constrains values, not only key
+  names: "set X, and X may only be one of these" is encodable. The v0
+  constraint grammar is `in` / `range` / `regex`.
 - **audience** names the executing node or agent. A grant presented to
   a different executor is invalid.
 - **principal_statement** is the human's verbatim words, signed
@@ -148,7 +153,12 @@ Field semantics:
 A grant is valid when its issuer is in the executing node's pinned root
 set. Two issuer models are supported; the distinction is part of the
 wire record, derivable from the grant's fields, and SHOULD be recorded
-in the executor's ledger with the executed action.
+in the executor's ledger as an `issuer_model` field (values
+`receiver-principal` / `sender-principal`) on the `grant.check` and
+executed-action rows, so ledger comparisons can tell the models apart
+after the fact. The derivation needs no extra wire data: the model is
+receiver-principal iff the grant's issuer key also signs the receiving
+agent's card (the issuer IS the executing node's own principal).
 
 - **Receiver-principal-issued.** The executing node's own principal
   signs a grant over one of its own agents: the issuer is the node's
@@ -191,8 +201,17 @@ Rules:
   receipts are protocol objects, not transport hopes. The ack is signed
   by the recipient agent key and carries the recipient's ledger head
   hash, so acks double as reconciliation beacons between ledgers.
+- Acks are terminal: an ack MUST NOT enter the sender's retry table
+  (nothing acks an ack, so a retried ack only manufactures false
+  undelivered rows), and an ack that arrives after its entry has left
+  the unacked table is ledgered as `msg.ack-late`, never dropped
+  silently - "peer never answered" and "answer arrived past the
+  deadline" must stay distinguishable when two ledgers are compared.
 - Sizing over a poll transport with interval P: `ack_deadline` =
-  2P + jitter; retries at 2P, 4P, 8P. After the final miss the sender
+  2P + jitter; retries at 2P, 4P, 8P. The deadline should be sized to
+  the PEER's poll period when it differs from the local one, or late
+  acks will be routine rather than exceptional. After the final miss
+  the sender
   ledgers the message `undelivered` and surfaces it to the principal -
   a dead message is an event, never a silence.
 - Ordering comes from the ledger (`prev_hash`), never from arrival
