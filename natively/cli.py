@@ -29,7 +29,8 @@ def cmd_principal_init(args):
 
 
 def cmd_hub(args):
-    hubmod.run(port=args.port, state_path=args.state)
+    roots = [r.strip() for r in (args.principal_pub or "").split(",") if r.strip()]
+    hubmod.run(port=args.port, state_path=args.state, principal_roots=roots)
 
 
 def cmd_node_init(args):
@@ -291,7 +292,7 @@ def main(argv=None):
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("principal-init"); p.add_argument("--out", required=True); p.set_defaults(f=cmd_principal_init)
-    p = sub.add_parser("hub"); p.add_argument("--port", type=int, default=8471); p.add_argument("--state"); p.set_defaults(f=cmd_hub)
+    p = sub.add_parser("hub"); p.add_argument("--port", type=int, default=8471); p.add_argument("--state"); p.add_argument("--principal-pub", help="comma-separated principal public keys (b64); when set, only cards they issued register"); p.set_defaults(f=cmd_hub)
     p = sub.add_parser("node-init"); p.add_argument("--name", required=True); p.add_argument("--hub", required=True); p.add_argument("--principal-pub", required=True); p.set_defaults(f=cmd_node_init)
     p = sub.add_parser("node-run"); p.set_defaults(f=cmd_node_run)
     p = sub.add_parser("agent-add"); p.add_argument("--name", required=True); p.add_argument("--principal", required=True); p.add_argument("--caps", default=""); p.set_defaults(f=cmd_agent_add)

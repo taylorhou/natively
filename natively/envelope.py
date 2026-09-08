@@ -33,6 +33,15 @@ def now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
+def parse_iso(ts: str) -> float:
+    """'YYYY-MM-DDTHH:MM:SSZ' -> epoch seconds. Raises ValueError on any
+    other shape (the protocol's timestamps are always this form)."""
+    import calendar
+    if not isinstance(ts, str):
+        raise ValueError("timestamp must be a string")
+    return float(calendar.timegm(time.strptime(ts, "%Y-%m-%dT%H:%M:%SZ")))
+
+
 def sign_obj(obj: dict, seed: bytes) -> dict:
     o = {k: v for k, v in obj.items() if k != "sig"}
     sig = crypto.sign(seed, jcs.canonicalize(o))
