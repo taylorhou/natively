@@ -40,6 +40,8 @@ def test_sender_card_from_an_unknown_principal_is_rejected(tmp_path, hub, princi
     n2.queue_send("beta", agent_key(n1, "alpha"), {"kind": "text", "text": "back"})
     pump([n2], 1)
     assert "error" in outcomes(n2, "msg.send")
+    # the class suffix rides the outcome string so the hash-only JSONL stays greppable
+    assert any(o.startswith("error:") for o in outcomes(n2, "msg.send", classified=True))
     assert not os.path.exists(os.path.join(n2.home, "sessions", "to_" + n1.fp + ".json"))
 
 

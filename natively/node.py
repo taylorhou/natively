@@ -113,6 +113,13 @@ class IdentityUnknown(IdentityError):
 def node_fp_of(node_key_prefixed: str) -> str:
     return jcs.sha256(crypto.b64d(node_key_prefixed.split(":", 1)[1]))[:32]
 
+def _oclass(e):
+    """Ledger outcome class for an exception: fleet greps the JSONL (hash
+    rows), so the error family must live in the outcome string, not only in
+    the prose mirror."""
+    return "error:" + type(e).__name__
+
+
 
 class Node:
     def __init__(self, home=None):
@@ -530,7 +537,7 @@ class Node:
                     # envelope to it is dead on arrival. Mark without
                     # re-resolving - a dead-fanout backlog drains in one pass.
                     self.ledger.append("node:%s" % self.name, None, "msg.send", {"file": f},
-                                       "error", "send failed: recipient identity: %s (same-pass verdict)" % dead[req["to"]])
+                                       "error:Identity", "send failed: recipient identity: %s (same-pass verdict)" % dead[req["to"]])
                     os.rename(path, path + ".err")
                     outcomes += 1
                     continue
@@ -614,7 +621,7 @@ class Node:
                                        "retry", "send deferred: %s" % e)
                 else:
                     self.ledger.append("node:%s" % self.name, None, "msg.send", {"file": f},
-                                       "error", "send failed: %s" % e)
+                                       _oclass(e), "send failed: %s" % e)
                     os.rename(path, path + ".err")
                     outcomes += 1
         if dirty:
@@ -657,13 +664,13 @@ class Node:
                 fresh_fp = sender_fp
             if fresh_fp == sender_fp:
                 self.ledger.append("node:%s" % self.name, None, "msg.recv",
-                                   {"msg_id": env["msg_id"]}, "error", "decrypt failed: %s" % e)
+                                   {"msg_id": env["msg_id"]}, _oclass(e), "decrypt failed: %s" % e)
                 return
             try:
                 body = self._dec_pairwise(fresh_fp, env["body"])
             except Exception as e2:
                 self.ledger.append("node:%s" % self.name, None, "msg.recv",
-                                   {"msg_id": env["msg_id"]}, "error", "decrypt failed: %s" % e2)
+                                   {"msg_id": env["msg_id"]}, _oclass(e2), "decrypt failed: %s" % e2)
                 return
         kind = body.get("kind")
         if env.get("type") == "ack" and kind == "ack":
@@ -812,7 +819,7 @@ class Node:
             self.queue_send(agent_name, sender_key, body, msg_type="ack")
         except Exception as e:
             self.ledger.append("agent:%s" % agent_name, None, "ack.send",
-                               {"msg_id": env["msg_id"]}, "error", str(e))
+                               {"msg_id": env["msg_id"]}, _oclass(e), str(e))
 
     def _handle_ack(self, env, body):
         mid = body.get("ack")
@@ -876,7 +883,7 @@ class Node:
                     continue
                 rec["next"] = now + (2 ** rec["attempts"]) * P
                 self.ledger.append("node:%s" % self.name, None, "msg.retry",
-                                   {"msg_id": mid}, "error", str(e))
+                                   {"msg_id": mid}, _oclass(e), str(e))
             except Exception as e:
                 rec["next"] = now + (2 ** rec["attempts"]) * P
         if dirty:
@@ -962,13 +969,13 @@ class Node:
                         # per-envelope boundary (#16): one poison message
                         # must never kill the loop or block the queue
                         self.ledger.append("node:%s" % self.name, None, "msg.recv",
-                                           {"msg_id": mid}, "error", "handle failed: %s" % e)
+                                           {"msg_id": mid}, _oclass(e), "handle failed: %s" % e)
                 else:
                     try:
                         self._handle_envelope(env)
                     except Exception as e:
                         self.ledger.append("node:%s" % self.name, None, "msg.recv",
-                                           {"msg_id": mid}, "error", "handle failed: %s" % e)
+                                           {"msg_id": mid}, _oclass(e), "handle failed: %s" % e)
                 self.state["last_seq"] = max(self.state["last_seq"], seq)
             self._save_state()
         except (urllib.error.URLError, OSError) as e:

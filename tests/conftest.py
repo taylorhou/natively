@@ -95,8 +95,16 @@ def ledger_entries(node):
     return list(node.ledger.entries())
 
 
-def outcomes(node, action):
-    return [e["outcome"] for e in ledger_entries(node) if e["action"] == action]
+def outcomes(node, action, classified=False):
+    # outcome strings may carry a class suffix ("error:CryptoError"); tests
+    # match the base outcome by default, pass classified=True for the raw
+    # classed strings.
+    def base(o):
+        # only the error family carries a class suffix; other outcomes like
+        # "acted:test.ping" keep their colon form.
+        return o.split(":", 1)[0] if o.startswith("error:") else o
+    return [(e["outcome"] if classified else base(e["outcome"]))
+            for e in ledger_entries(node) if e["action"] == action]
 
 
 def http(method, url, body=None, headers=None, raw=False):
