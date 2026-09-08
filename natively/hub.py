@@ -9,7 +9,8 @@ API (all JSON unless noted):
   GET  /v1/prekey/<node_fp>
   POST /v1/register           {node_key, name, ts, agents: [{name, agent_key, card}], sig}
   GET  /v1/directory          -> {agents: {...}, nodes: {...}}
-  POST /v1/msg                {envelope} -> {seq}
+  POST /v1/msg                {envelope} -> {queued, deduped}; 429 when the
+                              recipient's queue or the hub is at its quota
   GET  /v1/poll/<node_fp>?after=<seq>  (long-poll, timeout=25s)
                               header X-Natively-Auth: node-signed poll token
   POST /v1/blob               raw ciphertext body -> {blob_id, size}; 413 over the cap
@@ -76,27 +77,59 @@ def _within(ts, window_s) -> bool:
         return False
 
 
-def _evict_to_cap(q, cap):
-    """Kind-aware queue trim. Control envelopes (group_key distributions and
-    other protocol control, marked class=control by the sender) are the
-    irreplaceable traffic: a chatter flood must never evict them (plane-test-1
-    soak: group_key distributions repeatedly evicted from capped queues by
-    relay firehoses, silently bricking group membership). Evict oldest DATA
-    first; evict control only when nothing else remains. Returns (kept,
-    dropped)."""
-    if len(q) <= cap:
-        return q, []
-    drop_n = len(q) - cap
-    data_idx = [i for i, m in enumerate(q) if m.get("_class") != "control"]
-    drop = set(data_idx[:drop_n])
-    if len(drop) < drop_n:  # not enough data: oldest control takes the rest
-        rest = [i for i in range(len(q)) if i not in drop]
-        drop |= set(rest[:drop_n - len(drop)])
-    return [m for i, m in enumerate(q) if i not in drop], [q[i] for i in sorted(drop)]
+class StateCorrupt(Exception):
+    """The state file exists but is not what this hub wrote: the hub refuses
+    to start on it rather than come up empty (or partially loaded) behind
+    cursors its clients persisted."""
+
+
+def _queue_bytes(q):
+    return sum(m.get("_bytes", 0) for m in q)
+
+
+# Nesting bound on every JSON value the hub keeps (envelopes, registrations,
+# prekey bundles). A value the request thread can encode is not one the
+# saver thread can: a thread's stack is smaller than the main thread's, so
+# a value nested a few hundred levels deep passes the accept-time
+# json.dumps and then fails every snapshot write with RecursionError - the
+# state stays dirty forever. Wire values are a handful of levels deep;
+# anything past MAX_JSON_DEPTH is refused at the door, without recursion.
+MAX_JSON_DEPTH = 64
+
+
+def _nested_deeper_than(v, limit) -> bool:
+    # only containers are walked: the working set is the number of nested
+    # containers, never the number of elements (a flat array of scalars,
+    # however long, adds nothing)
+    stack = [(v, 1)] if isinstance(v, (dict, list)) else []
+    while stack:
+        x, d = stack.pop()
+        if d > limit:
+            return True
+        stack.extend((c, d + 1) for c in (x.values() if isinstance(x, dict) else x) if isinstance(c, (dict, list)))
+    return False
+
+
+# The sequence counters and poll cursors live in JSON: every value the hub
+# writes must read back through the strict reader (integers up to 2^53).
+# A poll cursor is refused past MAX_CURSOR, so the skew self-heal can never
+# advance a counter to where its next value is unreadable; the counters
+# themselves stop at MAX_SEQ (unreachable in practice: it is a message count).
+MAX_CURSOR = 2 ** 52
+MAX_SEQ = 2 ** 53
 
 
 class State:
     POLL_WAIT = 5.0  # long-poll wait when the queue is empty
+    # Storage bounds (review point 7). An envelope is accepted only when the
+    # recipient's queue has room under BOTH its count and byte quota and the
+    # hub as a whole is under its byte quota; otherwise the POST is refused
+    # with 429 and the sender keeps the envelope in its outbox for a later
+    # pass. Nothing accepted is ever discarded by a limit: what the hub
+    # said it queued stays queued until the recipient's poll prunes it.
+    QUEUE_MAX_MSGS = 500
+    QUEUE_MAX_BYTES = 16 * 1024 * 1024    # per recipient
+    TOTAL_MAX_BYTES = 256 * 1024 * 1024   # every queue together (a 1 GB VM)
 
     def __init__(self, path=None, principal_roots=None):
         self.lock = threading.Lock()
@@ -121,6 +154,10 @@ class State:
         self.seq = {}           # node_fp -> last seq
         self.qids = {}          # node_fp -> set(msg_id) for O(1) dedupe
         self._last_save = 0.0
+        self._dirty = False     # mutations the file does not have yet
+        self._saver = None      # the timer that writes them when the throttle held a save back
+        self._backoff = 0.0     # the retry delay after a failed write
+        self.closing = False    # set on shutdown: no request is accepted past the final flush
         self.conds = {}         # node_fp -> Condition: POST wakes only the target's pollers
         if path and os.path.exists(path):
             self._load()
@@ -133,23 +170,81 @@ class State:
         return c
 
     def _load(self):
+        """The persisted state, validated field by field before any of it is
+        installed. A file that does not parse or is not the shape this hub
+        writes is StateCorrupt: the hub does not start empty behind cursors
+        its clients persisted (new messages would be skipped and pruned),
+        and does not start on half of its state."""
         try:
-            d = json.load(open(self.path))
-            self.prekeys = d.get("prekeys", {})
-            self.nodes = d.get("nodes", {})
-            self.agent_dir = d.get("agent_dir", {})
-            self.agent_owner = d.get("agent_owner", {})
-            self.queues = d.get("queues", {})
-            self.seq = d.get("seq", {})
-            # load-time clamp: a bloated state file must not OOM the boot.
-            # senders re-POST unacked envelopes, so deep backlog is recoverable.
-            for fp, q in self.queues.items():
-                self.queues[fp], _ = _evict_to_cap(q, 500)
-            for fp, q in self.queues.items():
-                self.qids[fp] = {m.get("env", {}).get("msg_id") for m in q}
-            self._prune_directory()
-        except Exception as e:
-            print("hub: state load failed, starting empty:", e)
+            with open(self.path, "rb") as f:
+                d = jcs.loads(f.read())  # strict: a duplicate key or a NaN is not state this hub wrote
+        except (OSError, ValueError) as e:
+            raise StateCorrupt("hub state cannot be read: %s" % e)
+        if not isinstance(d, dict):
+            raise StateCorrupt("hub state is not an object")
+        parts = {}
+        for k in ("prekeys", "nodes", "agent_dir", "agent_owner", "queues", "seq"):
+            v = d.get(k, {})
+            if not isinstance(v, dict):
+                raise StateCorrupt("hub state field %s is not an object" % k)
+            parts[k] = v
+        def counter(v, floor=0):
+            return not isinstance(v, bool) and isinstance(v, int) and v >= floor
+
+        for fp, n in parts["seq"].items():
+            if not counter(n):
+                raise StateCorrupt("hub state seq for %s is not a counter" % fp)
+        for fp, q in parts["queues"].items():
+            if not isinstance(q, list) or not all(isinstance(m, dict) and isinstance(m.get("env"), dict)
+                                                   and counter(m.get("_seq"), 1)
+                                                   and ("_bytes" not in m or counter(m.get("_bytes")))
+                                                   for m in q):
+                raise StateCorrupt("hub state queue for %s is not a list of queued envelopes" % fp)
+            if q and parts["seq"].get(fp, 0) < max(m["_seq"] for m in q):
+                # a counter behind its own queue would hand a new envelope a
+                # sequence the recipient has already polled past: pruned unread
+                raise StateCorrupt("hub state seq for %s is behind its queue" % fp)
+            if any(b["_seq"] <= a["_seq"] for a, b in zip(q, q[1:])):
+                # a queue is served in order and pruned at the cursor: a row
+                # behind a later one would be pruned unread once the cursor
+                # passed the later one
+                raise StateCorrupt("hub state queue for %s is not in sequence order" % fp)
+        for k in ("prekeys", "nodes", "agent_dir"):
+            if not all(isinstance(v, dict) for v in parts[k].values()):
+                raise StateCorrupt("hub state field %s holds a record that is not an object" % k)
+        if not all(isinstance(v, str) for v in parts["agent_owner"].values()):
+            raise StateCorrupt("hub state field agent_owner holds an owner that is not a fingerprint")
+        # the fields the handlers consume from those records, checked here
+        # so a malformed value surfaces as StateCorrupt at start, never as
+        # an exception out of a request later
+        for fp, v in parts["nodes"].items():
+            if v.get("name") is None:
+                v["name"] = ""  # an earlier version stored a registration without a name as null
+            if not all(isinstance(v.get(k, ""), str) for k in ("name", "node_key", "reg_ts")):
+                raise StateCorrupt("hub state node record %s is malformed" % fp)
+            if "reg_ts" in v:
+                try:
+                    envelope.parse_iso(v["reg_ts"])  # every later registration compares against it
+                except Exception:
+                    raise StateCorrupt("hub state node record %s has a registration time that does not parse" % fp)
+        for name, v in parts["agent_dir"].items():
+            if (not isinstance(v.get("node_fp", ""), str) or not isinstance(v.get("agent_key", ""), str)
+                    or not isinstance(v.get("card", {}), dict)):
+                raise StateCorrupt("hub state directory record %s is malformed" % name)
+        for fp, q in parts["queues"].items():
+            if not all(isinstance(m["env"].get("msg_id", ""), str) for m in q):
+                raise StateCorrupt("hub state queue for %s holds an envelope whose msg_id is not a string" % fp)
+        self.prekeys, self.nodes = parts["prekeys"], parts["nodes"]
+        self.agent_dir, self.agent_owner = parts["agent_dir"], parts["agent_owner"]
+        self.queues, self.seq = parts["queues"], parts["seq"]
+        for q in self.queues.values():
+            for m in q:
+                m.setdefault("_bytes", len(json.dumps(m["env"], separators=(",", ":"))))
+        # nothing accepted is discarded at load: the queues come back as
+        # they were saved (their size is bounded by the enqueue quotas)
+        for fp, q in self.queues.items():
+            self.qids[fp] = {m.get("env", {}).get("msg_id") for m in q}
+        self._prune_directory()
 
     def _prune_directory(self):
         """Persisted directory entries must still be registerable today:
@@ -317,25 +412,101 @@ class State:
         except FileNotFoundError:
             return None
 
-    def close(self):
-        """A stateless hub's private store goes with it: nothing else can
-        reach those blobs once the process is gone."""
-        if self._private_store and os.path.isdir(self.blob_dir):
-            shutil.rmtree(self.blob_dir, ignore_errors=True)
+
+    def has_room(self, fps, nbytes) -> str:
+        """Called under the lock: '' when one copy of an envelope of `nbytes`
+        fits each recipient queue in `fps` AND all the copies together fit
+        the hub's total, else the reason. Nothing is accepted unless all of
+        it fits."""
+        for fp in fps:
+            q = self.queues.get(fp, [])
+            if len(q) >= self.QUEUE_MAX_MSGS:
+                return "recipient queue full (%d messages)" % len(q)
+            if _queue_bytes(q) + nbytes > self.QUEUE_MAX_BYTES:
+                return "recipient queue full (bytes)"
+        if sum(_queue_bytes(x) for x in self.queues.values()) + nbytes * len(fps) > self.TOTAL_MAX_BYTES:
+            return "hub storage full"
+        return ""
 
     def save(self, force=False):
+        """Persist the state (atomic, fsynced). Saves are throttled to one
+        per SAVE_INTERVAL, but a mutation the throttle held back is never
+        lost: it marks the state dirty and arms a timer that writes it when
+        the interval is up, so the file is at most SAVE_INTERVAL behind and
+        catches up even when traffic stops. force=True writes now. Called
+        under the lock or from the timer, which takes it."""
         if not self.path:
             return
-        import time
         now = time.time()
+        self._dirty = True
+        if not force and self._saver is not None:
+            return  # a write (or a retry after a failed one) is already scheduled: it takes this mutation along
         if not force and now - self._last_save < self.SAVE_INTERVAL:
+            self._arm(self.SAVE_INTERVAL - (now - self._last_save))
             return
-        self._last_save = now
+        self._write_or_arm(force)
+
+    def _arm(self, delay):
+        """Under the lock: a timer that writes the dirty state after `delay`
+        seconds, unless one is already armed."""
+        if self._saver is None:
+            self._saver = threading.Timer(max(0.0, delay), self._flush_dirty)
+            self._saver.daemon = True
+            self._saver.start()
+
+    def _write_or_arm(self, force=False):
+        """Under the lock: write now. A write that fails (the volume away,
+        full) keeps the state dirty and arms a retry with backoff -
+        SAVE_INTERVAL, doubling to a minute - so accepted mutations reach
+        the disk once it recovers, whether or not traffic continues. A
+        forced save (a registration, a prekey: answered only once they
+        are on disk) re-raises, so the handler answers a retryable
+        failure instead of 200 over state that is not persisted."""
+        try:
+            self._write()
+            self._backoff = 0.0
+        except Exception as e:  # the disk, or a snapshot that will not serialize: either way the retry stays armed
+            self._backoff = min(60.0, max(self.SAVE_INTERVAL, self._backoff * 2))
+            print("hub: state save failed (%s); retrying in %.0fs" % (e, self._backoff))
+            self._arm(self._backoff)
+            if force:
+                raise
+
+    def _flush_dirty(self):
+        with self.lock:
+            self._saver = None
+            if self._dirty:
+                self._write_or_arm()
+
+    def _write(self):
         d = {"prekeys": self.prekeys, "nodes": self.nodes, "agent_dir": self.agent_dir,
              "agent_owner": self.agent_owner, "queues": self.queues, "seq": self.seq}
         tmp = self.path + ".tmp"
-        json.dump(d, open(tmp, "w"))
+        with open(tmp, "w") as f:
+            json.dump(d, f)
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, self.path)
+        dfd = os.open(os.path.dirname(os.path.abspath(self.path)), os.O_RDONLY)
+        try:
+            os.fsync(dfd)  # the rename is durable too, not only the bytes
+        finally:
+            os.close(dfd)
+        self._last_save = time.time()  # only a write that happened counts
+        self._dirty = False
+
+    def close(self):
+        """On shutdown: whatever the throttle held back goes to disk; a
+        stateless hub's private blob store goes with it - nothing else can
+        reach those blobs once the process is gone."""
+        with self.lock:
+            if self._saver is not None:
+                self._saver.cancel()
+                self._saver = None
+            if self._dirty and self.path:
+                self._write()  # a failure here is the caller's to see: nothing left to retry from
+        if self._private_store and os.path.isdir(self.blob_dir):
+            shutil.rmtree(self.blob_dir, ignore_errors=True)
 
 
 def make_server(port: int, state: State):
@@ -467,7 +638,12 @@ def make_server(port: int, state: State):
                 after = 0
                 for kv in q.split("&"):
                     if kv.startswith("after="):
-                        after = int(kv[6:])
+                        try:
+                            after = int(kv[6:])
+                        except ValueError:
+                            return self._json(400, {"error": "bad cursor"})
+                if after < 0 or after > MAX_CURSOR:
+                    return self._json(400, {"error": "cursor out of range"})  # never advanced to where the counter's next value is unreadable
                 # a poll reads and prunes this node's queue: only the node
                 # whose registered key signed the token may do that
                 err = self._check_poll_token(fp, after)
@@ -503,6 +679,8 @@ def make_server(port: int, state: State):
             return self._json(404, {"error": "not found"})
 
         def do_PUT(self):
+            if self._refuse_if_closing():
+                return
             if self.path.startswith("/v1/prekey/"):
                 fp = self.path.rsplit("/", 1)[1]
                 b = self._body()  # read the body before any refusal: the connection is keep-alive
@@ -517,7 +695,7 @@ def make_server(port: int, state: State):
                 # verify bundle is signed by the node key it names, and that
                 # this key's fingerprint is the path it is stored under:
                 # nobody replaces another node's bundle with one of their own
-                if not isinstance(bundle, dict):
+                if not isinstance(bundle, dict) or _nested_deeper_than(bundle, MAX_JSON_DEPTH):
                     return self._json(400, {"error": "bad bundle"})
                 nk = _key_b64(bundle.get("node_key"))
                 if not _verify_signed(bundle, nk):
@@ -533,14 +711,29 @@ def make_server(port: int, state: State):
                 return self._json(200, {"ok": True})
             return self._json(404, {"error": "not found"})
 
+        def _refuse_if_closing(self):
+            """503 on shutdown - after draining the request body, so the
+            keep-alive connection is left in a usable state (an unread
+            body would be parsed as the next request line)."""
+            if not st.closing:
+                return False
+            if self._body() is not None:
+                self._json(503, {"error": "shutting down"})
+            else:
+                self._json(413, {"error": "too big"})  # too big to drain: answered, then the connection is dropped
+                self.close_connection = True  # nothing more rides this connection
+            return True
+
         def do_POST(self):
+            if self._refuse_if_closing():
+                return  # nothing is accepted past the final flush
             if self.path == "/v1/register":
                 b = self._body()
                 try:
                     reg = jcs.loads(b)
                 except Exception:
                     return self._json(400, {"error": "bad json"})
-                if not isinstance(reg, dict):
+                if not isinstance(reg, dict) or _nested_deeper_than(reg, MAX_JSON_DEPTH):
                     return self._json(400, {"error": "bad register"})
                 nk = _key_b64(reg.get("node_key"))
                 if not _verify_signed(reg, nk):
@@ -593,7 +786,8 @@ def make_server(port: int, state: State):
                         for name in [n for n, v in st.agent_dir.items()
                                      if v.get("node_fp") == owner and _key_b64(v.get("agent_key")) == key]:
                             del st.agent_dir[name]
-                    st.nodes[fp] = {"name": reg.get("name"), "node_key": reg["node_key"], "reg_ts": reg["ts"]}
+                    st.nodes[fp] = {"name": reg.get("name") if isinstance(reg.get("name"), str) else "",
+                                    "node_key": reg["node_key"], "reg_ts": reg["ts"]}
                     for name, e in entries.items():
                         st.agent_dir[name] = e
                         st.agent_owner[_key_b64(e["agent_key"])] = fp
@@ -603,12 +797,25 @@ def make_server(port: int, state: State):
                 return self._json(200, {"ok": True, "node_fp": fp})
             if self.path == "/v1/msg":
                 b = self._body()
+                if b is None or len(b) > st.QUEUE_MAX_BYTES:
+                    # before anything is parsed: what can never fit a queue
+                    # is refused on its length alone, so the parse (and the
+                    # objects it would build) never runs on it
+                    return self._json(413, {"error": "envelope larger than a recipient queue"})
                 try:
                     env = jcs.loads(b)
                 except Exception:
                     return self._json(400, {"error": "bad json"})
                 if not env.get("msg_id") or not env.get("to"):
                     return self._json(400, {"error": "missing fields"})
+                if not isinstance(env.get("msg_id"), str):
+                    return self._json(400, {"error": "msg_id must be a string"})  # the queue row must load again at the next start
+                try:
+                    json.dumps(env)  # what the state snapshot will have to write: refused now, never a saver that cannot run
+                except (RecursionError, ValueError, TypeError):
+                    return self._json(400, {"error": "envelope cannot be serialized"})
+                if _nested_deeper_than(env, MAX_JSON_DEPTH):
+                    return self._json(400, {"error": "envelope nested too deep"})  # the saver thread's stack, not this one's
                 with st.lock:
                     # route and enqueue under the one lock a registration
                     # replaces ownership under: no "unknown recipient" for
@@ -630,6 +837,30 @@ def make_server(port: int, state: State):
                     to_node = env.get("to_node")
                     if to_node is not None and targets != [to_node]:
                         return self._json(409, {"error": "recipient moved", "node_fp": targets[0]})
+                    # backpressure before anything is accepted: every target
+                    # must have room, or the whole POST is refused (429) and
+                    # the sender keeps the envelope for a later pass - a
+                    # queue limit never discards what was accepted
+                    if st.closing:
+                        # decided under the mutation lock: a request that
+                        # passed the early check before shutdown began
+                        # never enqueues after the final flush
+                        return self._json(503, {"error": "shutting down"})
+                    nbytes = len(b)
+                    fresh = list(dict.fromkeys(fp for fp in targets if env.get("msg_id") not in st.qids.get(fp, set())))  # a duplicate takes no room; one copy per node
+                    if any(st.seq.get(fp, 0) >= MAX_SEQ for fp in fresh):
+                        return self._json(503, {"error": "sequence exhausted"})  # the counter would not read back; unreachable by construction, refused by construction
+                    why = st.has_room(fresh, nbytes) if fresh else ""
+                    if why:
+                        if True:
+                            self.send_response(429)
+                            self.send_header("Retry-After", "5")
+                            body = json.dumps({"error": why}).encode()
+                            self.send_header("Content-Type", "application/json")
+                            self.send_header("Content-Length", str(len(body)))
+                            self.end_headers()
+                            self.wfile.write(body)
+                            return
                     queued = 0
                     deduped = 0
                     for fp in targets:
@@ -642,14 +873,10 @@ def make_server(port: int, state: State):
                         q = st.queues.setdefault(fp, [])
                         st.seq[fp] = st.seq.get(fp, 0) + 1
                         q.append(
-                            {"env": env, "_seq": st.seq[fp], "_queued_for": fp,
+                            {"env": env, "_seq": st.seq[fp], "_queued_for": fp, "_bytes": nbytes,
                              "_class": "control" if env.get("class") == "control" else "data"})
                         ids.add(env.get("msg_id"))
                         queued += 1
-                        kept, dropped = _evict_to_cap(q, 500)
-                        st.queues[fp] = kept
-                        for m in dropped:
-                            ids.discard(m.get("env", {}).get("msg_id"))
                     st.save()
                     for fp in targets:
                         st._cond(fp).notify_all()
@@ -666,14 +893,27 @@ def make_server(port: int, state: State):
                 return self._json(200, {"blob_id": bid, "size": len(b)})
             return self._json(404, {"error": "not found"})
 
-    return ThreadingHTTPServer(("0.0.0.0", port), H)
+    srv = ThreadingHTTPServer(("0.0.0.0", port), H)
+    srv.daemon_threads = False  # server_close joins every running handler: none mutates state or arms a saver after the final flush
+    return srv
 
 
 def run(port=8471, state_path=None, principal_roots=None):
-    st = State(state_path, principal_roots=principal_roots)
+    try:
+        st = State(state_path, principal_roots=principal_roots)
+    except StateCorrupt as e:
+        raise SystemExit("hub: refusing to start: %s (move the file aside to start empty on purpose)" % e)
     try:
         srv = make_server(port, st)  # inside the cleanup scope: a port already taken never leaks a private store
         print("natively hub listening on :%d" % port)
-        srv.serve_forever()
+        try:
+            srv.serve_forever()
+        finally:
+            # shutdown order: refuse new writes, let the handlers still
+            # running finish (server_close joins them), then the final flush
+            # - nothing is accepted after the state's last write
+            with st.lock:
+                st.closing = True
+            srv.server_close()
     finally:
-        st.close()
+        st.close()  # a save the throttle held back goes to disk on the way out
