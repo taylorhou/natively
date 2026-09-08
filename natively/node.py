@@ -9,6 +9,8 @@ import json
 import os
 import time
 import threading
+import http.client
+import urllib.parse
 import urllib.request
 import urllib.error
 from . import crypto, envelope, jcs
@@ -36,6 +38,61 @@ def _http(method, url, body=None, timeout=35, ctype="application/json", headers=
         req.add_header(k, v)
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return r.status, r.read()
+
+
+class _HubConn:
+    """HTTP/1.1 keep-alive connection to the hub for hot paths (flush, poll).
+
+    urllib reopens TCP+TLS per call - on the outbox flush that is ~3-4 RTT
+    per message, which caps a node's sequential send rate at the hub's
+    round-trip time (measured ~145/min at ~140ms RTT during the plane-test-1
+    soak, against a ~500/min local-work ceiling). Reusing one connection
+    drops a send to ~1 RTT. Cold paths (register, directory, prekeys) stay
+    on urllib: they run once per peer or per 5 min, not per message.
+    Broken/closed connections are reopened once and the request retried;
+    4xx responses surface as urllib.error.HTTPError so callers keep their
+    status-code handling.
+    """
+
+    def __init__(self, hub, timeout=35):
+        self.hub = hub
+        self.timeout = timeout
+        self._conn = None
+
+    def _connect(self):
+        u = urllib.parse.urlsplit(self.hub)
+        if u.scheme == "https":
+            self._conn = http.client.HTTPSConnection(u.hostname, u.port, timeout=self.timeout)
+        else:
+            self._conn = http.client.HTTPConnection(u.hostname, u.port, timeout=self.timeout)
+
+    def close(self):
+        try:
+            if self._conn is not None:
+                self._conn.close()
+        finally:
+            self._conn = None
+
+    def request(self, method, path, body=None, ctype="application/json", headers=None):
+        h = dict(headers or {})
+        if body is not None:
+            h["Content-Type"] = ctype
+        for attempt in (0, 1):
+            if self._conn is None:
+                self._connect()
+            try:
+                self._conn.request(method, path, body=body, headers=h)
+                r = self._conn.getresponse()
+                data = r.read()  # must drain before the connection is reusable
+                if r.status >= 400:
+                    raise urllib.error.HTTPError(self.hub + path, r.status, r.reason, r.headers, None)
+                return r.status, data
+            except urllib.error.HTTPError:
+                raise  # a real response arrived; the connection is fine
+            except (http.client.HTTPException, OSError):
+                self.close()
+                if attempt:
+                    raise
 
 
 class IdentityError(Exception):
@@ -66,6 +123,7 @@ class Node:
         self.node_seed = bytes.fromhex(open(os.path.join(self.home, "node.key")).read().strip())
         self.node_pub = crypto.sign_pub(self.node_seed)
         self.fp = jcs.sha256(self.node_pub)[:32]
+        self._hub_conn = None  # lazy _HubConn for hot paths (flush, poll, retry)
         self.spk_sk = bytes.fromhex(open(os.path.join(self.home, "spk.key")).read().strip())
         # Pinned root set: principal.pub (one key per line, the first is the
         # node's own principal) plus principals/<name>.pub, one file per
@@ -409,6 +467,14 @@ class Node:
             self.ledger.append("node:%s" % self.name, None, "node.register",
                                {}, "retry", "register failed: %s" % e)
 
+    def _hub_req(self, method, path, body=None, headers=None):
+        """Hub call over a persistent keep-alive connection (hot paths only:
+        flush sends, poll, retries). One TCP+TLS setup per node run instead
+        of one per message. Cold paths stay on _http/urllib."""
+        if self._hub_conn is None:
+            self._hub_conn = _HubConn(self.hub)
+        return self._hub_conn.request(method, path, body=body, headers=headers)
+
     def _flush_outbox(self):
         dead = {}  # recipient -> permanent identity verdict, this pass
         dirty = False  # state changed; saved once at pass end, not per send
@@ -493,7 +559,7 @@ class Node:
                     msg_type=req["msg_type"], extra={"to": req["to"] if req["to"].startswith("ed25519:") else "ed25519:" + req["to"],
                                                      "to_node": peer_fp})
                 try:
-                    _http("POST", "%s/v1/msg" % self.hub, json.dumps(env).encode())
+                    self._hub_req("POST", "/v1/msg", json.dumps(env).encode())
                 except urllib.error.HTTPError as e:
                     if e.code == 409:
                         self._dir_cache = (0.0, None)
@@ -760,7 +826,7 @@ class Node:
                                    "UNDELIVERED after 3 retries: %s (surface to principal)" % mid)
                 continue
             try:
-                _http("POST", "%s/v1/msg" % self.hub, json.dumps(rec["env"]).encode())
+                self._hub_req("POST", "/v1/msg", json.dumps(rec["env"]).encode())
                 rec["next"] = now + (2 ** rec["attempts"]) * P
             except urllib.error.HTTPError as e:
                 if e.code == 409:
@@ -832,8 +898,8 @@ class Node:
         self._flush_outbox()
         try:
             after = self.state["last_seq"]
-            _, b = _http("GET", "%s/v1/poll/%s?after=%d" % (self.hub, self.fp, after),
-                         headers={"X-Natively-Auth": self._auth_token("poll", after=after)})
+            _, b = self._hub_req("GET", "/v1/poll/%s?after=%d" % (self.fp, after),
+                                 headers={"X-Natively-Auth": self._auth_token("poll", after=after)})
             d = json.loads(b)
             for item in d.get("messages", []):
                 env = item.get("env", item)  # tolerate legacy unwrapped rows
