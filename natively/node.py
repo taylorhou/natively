@@ -418,13 +418,24 @@ class Node:
             # entries. IdentityUnknown (not yet registered) still queues -
             # the recipient may simply not have registered yet.
             try:
-                self._peer_card(m["agent_key"])
+                _, member_fp = self._peer_card(m["agent_key"])
             except IdentityUnknown:
-                pass
+                member_fp = None  # may simply not be registered yet: queue as usual
             except IdentityError as e:
                 self.ledger.append("agent:%s" % from_agent, None, "group.send",
                                    {"group_id": gid, "member": m["agent_key"]},
                                    "member-skipped", "member skipped: %s" % e)
+                continue
+            if member_fp == self.fp:
+                # Local member: queue the plaintext body directly instead of
+                # wrapping it in my own sender key. A loopback copy decrypts
+                # against my receive ratchet for MY OWN sender key, which the
+                # send side has already advanced - under newest-first flush
+                # ordering the delayed copies inevitably reject as
+                # "replayed/old sender-key message" and dead-letter (hit in
+                # the plane-test-1 soak). The plaintext never leaves the node
+                # either way: inbox files are local plaintext by design.
+                self.queue_send(from_agent, m["agent_key"], dict(body_obj, group_id=gid))
                 continue
             self.queue_send(from_agent, m["agent_key"], {
                 "kind": "group_relay", "wire": wire, "group_id": gid,
@@ -491,6 +502,19 @@ class Node:
         # budget, the backlog drains at a steady floor.
         files = [f for f in sorted(os.listdir(self.outbox_dir)) if f.endswith(".json")]
         order = files[-300:][::-1] + files[:-300][:100]
+        # Causal priority within the pass: a group_key distribution installs
+        # the receive state later group_relay messages decrypt under. Pure
+        # newest-first delivers a relay BEFORE its key when both were queued
+        # together (group created, then immediately used) - the receiver
+        # consumes the relay as unknown-group and the message is lost.
+        # Distributions go first, stable within their recency order.
+        def _kind(f):
+            try:
+                with open(os.path.join(self.outbox_dir, f)) as fh:
+                    return json.load(fh).get("body_obj", {}).get("kind")
+            except Exception:
+                return None
+        order.sort(key=lambda f: 0 if _kind(f) == "group_key" else 1)
         for i, f in enumerate(order):
             if outcomes >= FLUSH_BATCH:
                 break
