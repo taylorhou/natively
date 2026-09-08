@@ -49,6 +49,37 @@ def _w600(path, data: bytes):
     os.close(fd)
 
 
+def _w600_replace(path, data: bytes):
+    """Rewrite an existing private file in one step: the old content or
+    the new, never a truncated one in between; durable before it is
+    relied on."""
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+    os.replace(tmp, path)
+    dfd = os.open(os.path.dirname(os.path.abspath(path)), os.O_RDONLY)
+    try:
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
+
+
+def _bare_key(k):
+    """One form for a recipient key, prefixed or not: the wire recipient
+    is the same either way, so holds and file records compare in one form."""
+    return k.split(":", 1)[1] if isinstance(k, str) and k.startswith("ed25519:") else k
+
+
 def _http(method, url, body=None, timeout=35, ctype="application/json", headers=None):
     req = urllib.request.Request(url, data=body, method=method)
     if body is not None:
@@ -217,6 +248,8 @@ class Node:
         self.node_key = "ed25519:" + crypto.b64e(self.node_pub)
         self.fp = jcs.sha256(self.node_pub)[:32]
         self._hub_conn = None  # lazy _HubConn for hot paths (flush, poll, retry)
+        self._backoff = {}     # outbox file -> (not before, delay): a send the hub asked to wait on (429)
+        self._file_to = {}     # outbox file -> its recipient, learnt when the file is first read
         self.spk_sk = bytes.fromhex(open(os.path.join(self.home, "spk.key")).read().strip())
         # Pinned root set: principal.pub (one key per line, the first is the
         # node's own principal) plus principals/<name>.pub, one file per
@@ -897,6 +930,30 @@ class Node:
         # then a guaranteed oldest slice of 100 - live latency wins the
         # budget, the backlog drains at a steady floor.
         files = [f for f in sorted(os.listdir(self.outbox_dir)) if f.endswith(".json")]
+        # a file the hub asked to wait on (429, Retry-After) is not
+        # attempted before its time and spends none of this pass's budget:
+        # a backpressured recipient never starves every other delivery.
+        # Eligibility is decided BEFORE the windows below are cut, so a
+        # deferred backlog never hides an eligible file in the middle.
+        # And a recipient whose control envelope (a group key) is waiting
+        # holds its later relays too: a relay must never overtake the key
+        # it decrypts under, backpressure included.
+        now = time.time()
+        present = set(files)
+        self._backoff = {f: v for f, v in self._backoff.items() if f in present}
+        self._file_to = {f: v for f, v in self._file_to.items() if f in present}
+        held_to = set()
+        for f in files:
+            if f.startswith("ctl_") and self._backoff.get(f, (0.0, 0.0))[0] > now:
+                try:
+                    held_to.add(_bare_key(json.load(open(os.path.join(self.outbox_dir, f))).get("to")))
+                except (OSError, ValueError):
+                    pass
+        # a file whose recipient is known (read on an earlier pass) to be
+        # held stays out of the windows and the attempt count altogether;
+        # one not read yet is found held when it is read, and known after
+        files = [f for f in files if self._backoff.get(f, (0.0, 0.0))[0] <= now
+                 and not (not f.startswith("ctl_") and self._file_to.get(f) in held_to)]
         # Causal priority: a group_key distribution installs the receive
         # state later group_relay messages decrypt under. Newest-first alone
         # delivers a relay BEFORE its key when both were queued together
@@ -907,16 +964,22 @@ class Node:
         ctl = [f for f in files if f.startswith("ctl_")]
         rest = [f for f in files if not f.startswith("ctl_")]
         order = ctl[::-1] + rest[-self.LIVE_WINDOW:][::-1] + rest[:-self.LIVE_WINDOW][:self.DRAIN_SLICE]
-        for i, f in enumerate(order):
-            if outcomes >= FLUSH_BATCH or i >= FLUSH_BATCH:
+        attempts = 0
+        for f in order:
+            if outcomes >= FLUSH_BATCH or attempts >= FLUSH_BATCH:
                 break  # attempts are bounded too: an outage must not spend one timeout per queued file before the poll
-            if i and i % 200 == 0:
+            if attempts and attempts % 200 == 0:
                 self._maybe_reregister()
             path = os.path.join(self.outbox_dir, f)
+            env = None
             try:
                 req = json.load(open(path))
+                self._file_to[f] = _bare_key(req.get("to"))
                 if self._relay_waits_for_key(req, pending_cache):
                     continue  # its key distribution has not been queued yet: the file stays for a later pass
+                if not f.startswith("ctl_") and _bare_key(req.get("to")) in held_to:
+                    continue  # its recipient's control envelope is waiting on the hub: this file waits behind it (no attempt spent)
+                attempts += 1
                 if req["to"] in dead:
                     # a recipient already found permanently undeliverable in
                     # this pass (e.g. card principal not in the pinned root
@@ -966,19 +1029,26 @@ class Node:
                     self._deliver_local(agent_name, fake_env, req["body_obj"])
                     os.unlink(path)
                     continue
-                ct_b64 = self._enc_pairwise(peer_fp, req["body_obj"])
-                # to_node: the node this ciphertext is for. The hub refuses
-                # (409) when the recipient now lives elsewhere, so a card
-                # cached across a move never strands a message on the
-                # wrong node; the sender refreshes and re-encrypts.
-                extra = {"to": req["to"] if req["to"].startswith("ed25519:") else "ed25519:" + req["to"],
-                         "to_node": peer_fp}
-                if req.get("control"):
-                    extra["class"] = "control"
-                env = envelope.make_message(
-                    a["card"]["agent_key"].split(":", 1)[1], req["to"].split(":", 1)[-1],
-                    ct_b64, a["seed"], grant_ids=req["grant_ids"], in_reply_to=req.get("in_reply_to"),
-                    msg_type=req["msg_type"], extra=extra)
+                env = req.get("env")
+                if not (isinstance(env, dict) and env.get("to_node") == peer_fp):
+                    # a send the hub asked to wait on (429) kept the envelope
+                    # it built in the request file: the same bytes go again,
+                    # one ratchet step per message however many passes the
+                    # hub refuses it. Only a recipient that moved gets a new
+                    # ciphertext.
+                    ct_b64 = self._enc_pairwise(peer_fp, req["body_obj"])
+                    # to_node: the node this ciphertext is for. The hub refuses
+                    # (409) when the recipient now lives elsewhere, so a card
+                    # cached across a move never strands a message on the
+                    # wrong node; the sender refreshes and re-encrypts.
+                    extra = {"to": req["to"] if req["to"].startswith("ed25519:") else "ed25519:" + req["to"],
+                             "to_node": peer_fp}
+                    if req.get("control"):
+                        extra["class"] = "control"
+                    env = envelope.make_message(
+                        a["card"]["agent_key"].split(":", 1)[1], req["to"].split(":", 1)[-1],
+                        ct_b64, a["seed"], grant_ids=req["grant_ids"], in_reply_to=req.get("in_reply_to"),
+                        msg_type=req["msg_type"], extra=extra)
                 try:
                     self._hub_req("POST", "/v1/msg", json.dumps(env).encode())
                 except urllib.error.HTTPError as e:
@@ -1012,8 +1082,27 @@ class Node:
                 outcomes += 1
             except Exception as e:
                 transient = isinstance(e, (urllib.error.URLError, TimeoutError, OSError, IdentityUnknown, RecipientMoved))
-                if isinstance(e, urllib.error.HTTPError) and 400 <= e.code < 500:
-                    transient = False  # 4xx is a permanent rejection, not a retry case
+                if isinstance(e, urllib.error.HTTPError) and 400 <= e.code < 500 and e.code != 429:
+                    transient = False  # 4xx is a permanent rejection, not a retry case - except 429, the hub asking for room
+                if isinstance(e, urllib.error.HTTPError) and e.code == 429:
+                    # the hub has no room for this recipient: wait what it
+                    # says (Retry-After), doubling on every further refusal
+                    # up to a minute; the file stays, other files go on
+                    try:
+                        asked = float((e.headers or {}).get("Retry-After", 0) or 0)
+                    except (TypeError, ValueError):
+                        asked = 0.0
+                    prev = self._backoff.get(f, (0.0, 0.0))[1]
+                    delay = min(60.0, max(asked, prev * 2, float(P)))
+                    self._backoff[f] = (time.time() + delay, delay)
+                    if isinstance(env, dict) and req.get("env") is not env:
+                        req["env"] = env  # the envelope this pass built goes again as it is, next pass
+                        _w600_replace(path, json.dumps(req).encode())
+                    if f.startswith("ctl_"):
+                        held_to.add(_bare_key(req.get("to")))  # from now on in this pass its relays wait behind it too
+                    self.ledger.append("node:%s" % self.name, None, "msg.send", {"file": f},
+                                       "retry", "send deferred %.0fs: %s" % (delay, e))
+                    continue
                 if transient and isinstance(e, IdentityUnknown):
                     # Recipient not in the directory: retryable while it
                     # may still register, terminal after DEFER_UNKNOWN_TTL
