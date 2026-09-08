@@ -417,13 +417,19 @@ class Node:
         # starve the poll side - inbound latency matters more than drain
         # speed, and the remaining files are picked up next pass.
         FLUSH_BATCH = 400
-        for i, f in enumerate(sorted(os.listdir(self.outbox_dir))):
+        # Two-phase order. Live traffic is the newest files; dead backlog is
+        # the oldest. Newest-first alone would starve the drain whenever
+        # arrivals fill the cap; oldest-first makes live sends queue behind
+        # thousands of verdict marks. So: a live window of the newest 300,
+        # then a guaranteed oldest slice of 100 - live latency wins the
+        # budget, the backlog drains at a steady floor.
+        files = [f for f in sorted(os.listdir(self.outbox_dir)) if f.endswith(".json")]
+        order = files[-300:][::-1] + files[:-300][:100]
+        for i, f in enumerate(order):
             if outcomes >= FLUSH_BATCH:
                 break
             if i and i % 200 == 0:
                 self._maybe_reregister()
-            if not f.endswith(".json"):
-                continue
             path = os.path.join(self.outbox_dir, f)
             try:
                 req = json.load(open(path))
