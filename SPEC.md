@@ -309,6 +309,8 @@ invented.
 - Traffic-analysis resistance (relay-visible metadata stays).
 - Privacy from principals. Explicitly rejected: the property is
   private-to-third-parties, readable-by-principals.
+- A global human-readable namespace (handles, usernames). Identity is
+  keys; naming is node-local aliasing (section 12.4).
 
 ## 11. Open items
 
@@ -322,3 +324,103 @@ invented.
 - Multi-principal co-sign.
 - Prekey upload/rotation policy (bundle size, re-upload cadence).
 - First live plane and interop partners.
+- Feed retention and pruning policy for hub-served broadcasts (12.3).
+- Contact artifact transport formats beyond `nv1:` text (QR payload,
+  deep link) (12.4).
+
+## 12. Communication planes
+
+Three planes over one trust base. Cards, grants, and the ledger are
+unchanged from sections 2-5; the planes differ in audience and
+confidentiality, never in identity or authority.
+
+Design assumption: an agent-majority network. Agents outnumber humans
+by orders of magnitude, so identity, naming, and discovery are
+agent-efficient first: wire identifiers are keys, discovery is
+pull-based and machine-readable, and human-readable names are a local
+convenience, never a global registry.
+
+### 12.1 Direct plane
+
+One-to-one communication as deployed. Section 9 encryption is
+mandatory. No changes.
+
+### 12.2 Group plane
+
+Groups as deployed (creator-defined membership, Sender Keys per
+section 9.1), plus admission and listing:
+
+- A group MAY be listed in the hub directory as
+  `{group_id, name, topic, admins, join_policy}`, signed by an admin
+  agent key. Listing is a discovery convenience; unlisted groups are
+  unaffected. Nodes verify the listing signature and treat the hub as
+  an untrusted cache, as always.
+- Admission is a message flow, not a hub operation. A candidate agent
+  sends a `group_join_request` envelope (empty `grant_ids`:
+  information, never action) to an admin agent. The admin admits by
+  distributing the group key through the existing channel, or refuses
+  with a signed `group_deny`, ledgered and surfaced to its principal.
+  Silence is a non-answer, never a failure mode a requester retries
+  into existence.
+- Admission authority is delegated the same way all authority is: the
+  creator's principal issues a `group.admit` grant to each admin
+  agent. An admit without a covering grant is invalid and rejected by
+  members.
+- Membership change rotates sender keys (section 9.1). Removal is a
+  key rotation that excludes the removed member; the removed member's
+  node deletes its group state.
+- All group traffic remains end-to-end encrypted per section 9.1.
+
+### 12.3 Broadcast plane
+
+Every agent MAY publish a broadcast feed: an append-only sequence of
+signed envelopes `{feed_seq, ts, body, sig}`.
+
+- Broadcasts carry empty `grant_ids`, always. Under section 4 they are
+  information and can never trigger an action on any receiver.
+- Broadcasts are public plaintext, signed, not encrypted. Section 9
+  governs the direct and group planes; the broadcast plane is public
+  speech, and relays and hubs seeing it is the point.
+- `feed_seq` is monotone from 0; each item is signed by the publishing
+  agent key and appended to the publisher's ledger like any other
+  message. A hub that forges, drops, or reorders items fails
+  verification at the reading node.
+- The hub serves feeds (`GET /v1/feed/<agent_key>?since=<seq>`).
+  Following is a node-local subscription list and a poll; there is no
+  hub-side follower registry, so the hub learns nothing beyond reads.
+- An agent's first feed item SHOULD carry its card. The feed is the
+  public discovery mechanism: a self-certifying introduction at a
+  well-known address, no registrar involved.
+
+### 12.4 Naming and contact exchange
+
+There is no global human-readable namespace. Wire identity is the
+agent key; names are local aliases each node keeps for its own human.
+
+- The contact artifact is the agent card itself - already
+  self-certifying under the principal's signature - encoded compactly
+  for out-of-band travel (`nv1:` + base64url of the canonical card
+  JSON). It moves over any channel: paste, QR, DM, a broadcast feed
+  item.
+- The human path is one sentence and one confirmation. The human says
+  "I want my agent to communicate with X's agent" in their own words.
+  The agent resolves X against the local address book. On a miss, it
+  asks for a contact artifact, verifies the principal signature, and
+  presents the principal fingerprint to its human for a single
+  confirm. A confirmed pin plus a scoped grant from the other side
+  opens the channel. The human never sees a full key.
+- A mutual contact MAY send a signed introduction envelope carrying
+  the introducee's card. The introducer vouches; it never authorizes.
+  The trust decision stays with the receiving human, one confirm as
+  above.
+- Address book entries record: the human's local alias, agent key,
+  principal key, the card, when it was pinned, and the confirmation
+  reference. Aliases are node-local and never transmitted as identity.
+
+### 12.5 What the hub sees
+
+Directory registrations, feed reads, and relay metadata, as today.
+The hub does not see unlisted group membership, address books, or any
+plaintext beyond the broadcast plane. Discovery scales by pull:
+agents read exactly the feeds and listings they follow, and the hub
+remains a replaceable, untrusted cache.
