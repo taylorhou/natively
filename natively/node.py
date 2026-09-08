@@ -153,6 +153,7 @@ class Node:
         self.hub = self.cfg["hub_url"].rstrip("/")
         self.node_seed = bytes.fromhex(open(os.path.join(self.home, "node.key")).read().strip())
         self.node_pub = crypto.sign_pub(self.node_seed)
+        self.node_key = "ed25519:" + crypto.b64e(self.node_pub)
         self.fp = jcs.sha256(self.node_pub)[:32]
         self._hub_conn = None  # lazy _HubConn for hot paths (flush, poll, retry)
         self.spk_sk = bytes.fromhex(open(os.path.join(self.home, "spk.key")).read().strip())
@@ -168,6 +169,11 @@ class Node:
             for f in sorted(os.listdir(pdir)):
                 if f.endswith(".pub"):
                     roots += [ln.strip() for ln in open(os.path.join(pdir, f)) if ln.strip()]
+        for r in roots:
+            try:
+                envelope.key_bytes("ed25519:" + r)
+            except ValueError:
+                raise ValueError("pinned principal key is malformed: %r" % r)
         self.principal_pub = roots[0]
         self.principal_roots = set(roots)
         self._dir_cache = (0.0, None)
@@ -186,7 +192,7 @@ class Node:
         p = self.state_path
         if os.path.exists(p):
             return json.load(open(p))
-        return {"last_seq": 0, "unacked": {}, "grant_uses": {}, "seen": []}
+        return {"last_seq": 0, "unacked": {}, "seen": []}
 
     def _save_state(self):
         tmp = self.state_path + ".tmp"
@@ -343,11 +349,8 @@ class Node:
         try:
             if not isinstance(card, dict) or card.get("agent_key") != "ed25519:" + key:
                 raise IdentityError("card does not name this agent key")
-            ref = card.get("principal_key_ref", "")
-            if not isinstance(ref, str) or ref.split(":", 1)[-1] not in self.principal_roots:
-                raise IdentityError("card principal not in the pinned root set")
-            if not envelope.verify_card(card, ref.split(":", 1)[-1]):
-                raise IdentityError("card signature invalid or card expired")
+            if not envelope.verify_card(card, self.principal_roots):
+                raise IdentityError("card not verified under the pinned root set")
             fp = node_fp_of(card["node_key"])
         except IdentityError:
             raise
@@ -666,7 +669,8 @@ class Node:
                         "env": env, "attempts": 1, "next": time.time() + 2 * P,
                         "peer_fp": peer_fp}
                 dirty = True  # saved once at pass end; a crash costs at most a duplicate send, and apply is idempotent on msg_id
-                self.ledger.append("agent:%s" % req["from_agent"], req["grant_ids"][0] if req["grant_ids"] else None,
+                gids = [g for g in (req.get("grant_ids") or []) if envelope.safe_id(g, "grt")]  # the row names a grant id or none
+                self.ledger.append("agent:%s" % req["from_agent"], gids[0] if gids else None,
                                    "msg.send", {"to": req["to"], "msg_id": env["msg_id"]}, "queued",
                                    "sent %s to %s" % (req["body_obj"].get("kind", "msg"), req["to"]))
                 os.unlink(path)
@@ -882,11 +886,65 @@ class Node:
                            "msg.recv", {"msg_id": env["msg_id"], "from": env["from"], "kind": kind},
                            outcome, "received %s from %s" % (kind, env["from"]))
 
+    def _load_grant(self, gid):
+        """The grant held locally under `gid`, or None. The file must carry
+        the same grant_id as its name: accounting is under the signed id,
+        never a path alias."""
+        if not envelope.safe_id(gid, "grt"):
+            return None
+        gpath = os.path.join(self.home, "grants", gid + ".json")
+        if not os.path.exists(gpath):
+            return None
+        try:
+            g = json.load(open(gpath))
+        except ValueError:
+            return None
+        if not isinstance(g, dict) or g.get("grant_id") != gid:
+            return None
+        return g
+
+    def _grant_uses(self, gid, since=None, scope=None):
+        """Executions ledgered under this grant: entries with outcome ok
+        whose action is the executed one (never the grant.check rows), at
+        or after `since` (epoch seconds) when given, under scope entry
+        `scope` when given (an entry that recorded no scope counts for
+        every scope). Ledger timestamps are whole seconds, so a row is
+        taken as up to one second later than written: a use never leaves
+        a window early. The ledger is the one durable record of use, so
+        accounting survives a lost state file; its per-grant index makes
+        a check cost this grant's rows, not the lifetime ledger."""
+        n = 0
+        for e in self.ledger.rows_for_grant(gid):
+            if e.get("outcome") != "ok" or e.get("action") == "grant.check":
+                continue
+            if scope is not None and "scope" in e and e["scope"] != scope:
+                continue
+            if since is not None:
+                try:
+                    if envelope.parse_iso(e.get("ts")) + 1 <= since:
+                        continue
+                except ValueError:
+                    pass  # a use whose age is unknown counts against every window: unknown never frees budget
+            n += 1
+        return n
+
     def _apply_grants(self, env, agent_name, body):
-        """Action path: a message with grant_ids asks for an action. v0
-        supports test.ping only; everything else refuses (spec 1: failure
-        is shown)."""
-        acted = "information-only"
+        """Action path (spec 3, 4): the message asks for an action under the
+        grants it lists. Each listed grant is checked in order - well
+        formed and principal-signed, subject = the receiving agent (card
+        hash AND key), executor = this node or that agent, a host-bound
+        resource naming this node, scope covering action/resource/params, budget
+        left (counted from the ledger) - and the FIRST grant that passes
+        executes the action exactly once. Grants that fail are ledgered
+        with the reason. v0 executes test.ping only; any other action is
+        refused (spec 1: failure is shown)."""
+        a = self.agents[agent_name]
+        card = a["card"]
+        action, resource, params = body.get("action"), body.get("resource"), body.get("params")
+        if not isinstance(action, str) or not action or not isinstance(resource, str) or not isinstance(params, dict):
+            self.ledger.append("agent:%s" % agent_name, None, "grant.check", {"msg_id": env["msg_id"]},
+                               "malformed-action", "action, resource and params must be present and typed")
+            return "information-only"
         seen_ids = set()
         for gid in env.get("grant_ids", []):
             # the id names the grant file: only the id grammar reaches a
@@ -899,91 +957,93 @@ class Node:
             if gid in seen_ids:
                 continue  # listed twice: one grant, one check, one use
             seen_ids.add(gid)
-            gpath = os.path.join(self.home, "grants", gid + ".json")
-            if not os.path.exists(gpath):
+            g = self._load_grant(gid)
+            if g is None:
                 self.ledger.append("agent:%s" % agent_name, gid, "grant.check", {}, "unknown-grant",
-                                   "grant %s not held locally" % gid)
+                                   "grant %s not held locally under its own id" % gid)
                 continue
-            g = json.load(open(gpath))
-            if not isinstance(g, dict) or g.get("grant_id") != gid:
-                self.ledger.append("agent:%s" % agent_name, gid, "grant.check", {}, "invalid",
-                                   "grant file does not carry this grant_id")
-                continue
-            try:
-                # a grant counts when its issuer is any pinned root (own
-                # principal.pub or an installed principals/<name>.pub) -
-                # the cross-principal exchange case; verify against the
-                # issuer named in the grant, never a fixed local key
-                ik = g.get("issuer", {}).get("key", "").split(":", 1)[-1]
-                if ik not in self.principal_roots:
-                    raise envelope.GrantError("grant issuer not in the pinned root set")
-                envelope.verify_grant(g, ik)
-            except Exception as e:
-                self.ledger.append("agent:%s" % agent_name, gid, "grant.check", {}, "invalid", str(e))
-                continue
-            # subject binding (spec 4 confused-deputy rule)
-            subj_card = None
-            for n, a in self.agents.items():
-                if envelope.obj_hash(a["card"]) == g["subject"]["agent"]:
-                    subj_card = (n, a)
-                    break
-            if subj_card is None or subj_card[0] != agent_name:
-                self.ledger.append("agent:%s" % agent_name, gid, "grant.check", {}, "wrong-subject",
-                                   "grant subject is not the receiving agent - information only")
-                continue
-            # Issuer model (spec 3): derivable once the subject card is
-            # bound - receiver-principal iff the grant issuer also signs
-            # the receiving agent's card, i.e. IS the executing node's own
-            # principal; anything else is a foreign (sender-side) root.
-            issuer_model = ("receiver-principal"
-                            if g["issuer"]["key"].split(":", 1)[-1]
-                            == subj_card[1]["card"].get("principal_key_ref", "").split(":", 1)[-1]
+            # issuer model (spec 3): receiver-principal iff the grant's
+            # issuer also signs the receiving agent's card, i.e. IS this
+            # node's own principal; any other pinned root is sender-side.
+            # Whole canonical key references are compared, never a
+            # prefix-stripped form.
+            issuer = g.get("issuer") if isinstance(g.get("issuer"), dict) else {}
+            issuer_model = ("receiver-principal" if issuer.get("key") == card.get("principal_key_ref")
                             else "sender-principal")
-            # audience.executor (spec 3): a grant is valid only for the
-            # named executing node or agent; presented anywhere else it is
-            # invalid. Accept the prefixed or bare key form.
-            ek = str(g.get("audience", {}).get("executor", "")).split(":")[-1]
-            valid_exec = {crypto.b64e(self.node_pub)}
-            valid_exec |= {a["card"]["agent_key"].split(":", 1)[-1]
-                           for a in self.agents.values()}
-            if ek not in valid_exec:
-                self.ledger.append("agent:%s" % agent_name, gid, "grant.check", {},
-                                   "wrong-executor", "grant audience names a different executor",
+            # subject binding (spec 4 confused-deputy rule): hash AND key
+            subj = g.get("subject") if isinstance(g.get("subject"), dict) else {}
+            if subj.get("agent") != envelope.obj_hash(card) or subj.get("key") != card["agent_key"]:
+                self.ledger.append("agent:%s" % agent_name, gid, "grant.check", {}, "wrong-subject",
+                                   "grant subject is not the receiving agent - information only",
                                    issuer_model=issuer_model)
                 continue
-            action = body.get("action")
-            resource = body.get("resource", "")
-            params = body.get("params", {})
             try:
-                covers = envelope.grant_covers(g, action, resource, params)
-            except Exception as e:
-                # a validly-signed but malformed grant is ledgered invalid,
-                # never a handler crash (the exchange failure class of
-                # 2026-09-08, mirrored on both implementations)
-                self.ledger.append("agent:%s" % agent_name, gid, "grant.check",
-                                   {"action": action}, "invalid", str(e), issuer_model=issuer_model)
+                envelope.verify_grant(g, self.principal_roots, subject_card=card)
+            except envelope.GrantError as e:
+                self.ledger.append("agent:%s" % agent_name, gid, "grant.check", {}, "invalid", str(e),
+                                   issuer_model=issuer_model)
                 continue
-            if not covers:
+            # audience: the executing node or the receiving agent (spec 3),
+            # in the prefixed or the bare key form
+            ek = str(g["audience"]["executor"]).split(":", 1)[-1]
+            if ek not in (self.node_key.split(":", 1)[-1], card["agent_key"].split(":", 1)[-1]):
+                self.ledger.append("agent:%s" % agent_name, gid, "grant.check", {}, "wrong-executor",
+                                   "grant audience names a different executor", issuer_model=issuer_model)
+                continue
+            # the resource is an opaque label matched literally (spec 3);
+            # one in the host:<node-key>:<name> form names a host, and that
+            # host must be this node, so a host-bound grant is never
+            # replayed against another machine that holds the same file
+            parsed = envelope.parse_resource(resource)
+            if parsed is not None and parsed[0] != self.node_key:
+                self.ledger.append("agent:%s" % agent_name, gid, "grant.check", {"resource": resource},
+                                   "wrong-host", "resource is bound to another host", issuer_model=issuer_model)
+                continue
+            covering = envelope.covering_entries(g, action, resource, params)
+            if not covering:
                 self.ledger.append("agent:%s" % agent_name, gid, "grant.check",
                                    {"action": action}, "out-of-scope", "refused",
                                    issuer_model=issuer_model)
                 continue
-            uses = self.state["grant_uses"].get(gid, 0)
-            if "max_uses" in g and uses >= g["max_uses"]:
-                self.ledger.append("agent:%s" % agent_name, gid, "grant.check", {}, "exhausted", "max_uses reached",
+            # the first covering entry with budget left is the one charged
+            # (by its own index, never a look-alike's); an entry whose
+            # window is spent does not hide a later entry that still covers
+            chosen = None
+            if "max_uses" in g:
+                uses, budget = self._grant_uses(gid), g["max_uses"]
+                if uses < budget:
+                    chosen = covering[0]
+                    left = "%d/%d" % (uses + 1, budget)
+                else:
+                    why = "max_uses reached"
+            else:
+                # a window belongs to its scope entry: uses under another
+                # entry of the same grant do not count against it
+                for scope_i, sc in covering:
+                    w = sc["max_uses_per_window"]
+                    uses, budget = self._grant_uses(gid, since=time.time() - w["window_s"], scope=scope_i), w["n"]
+                    if uses < budget:
+                        chosen = (scope_i, sc)
+                        left = "%d/%d per %ds" % (uses + 1, budget, w["window_s"])
+                        break
+                    why = "%d uses in the last %ds" % (uses, w["window_s"])
+            if chosen is None:
+                self.ledger.append("agent:%s" % agent_name, gid, "grant.check", {}, "exhausted", why,
                                    issuer_model=issuer_model)
                 continue
+            scope_i, sc = chosen
+            # the message's seen entry goes to disk before the action runs:
+            # a crash between the two must not let the same msg_id, resent
+            # with fresh ciphertext, execute again on the next start
+            self._save_state()
             if action == "test.ping":
-                self.state["grant_uses"][gid] = uses + 1
-                self._save_state()
-                self.ledger.append("agent:%s" % agent_name, gid, "test.ping", params, "ok",
-                                   "pong (%d/%s)" % (uses + 1, g.get("max_uses", "-")),
-                                   issuer_model=issuer_model)
-                acted = "acted:test.ping"
-            else:
-                self.ledger.append("agent:%s" % agent_name, gid, action, params, "unsupported",
-                                   "no v0 executor for action %s" % action, issuer_model=issuer_model)
-        return acted
+                self.ledger.append("agent:%s" % agent_name, gid, "test.ping", params, "ok", "pong (%s)" % left,
+                                   scope=scope_i, issuer_model=issuer_model)
+                return "acted:test.ping"
+            self.ledger.append("agent:%s" % agent_name, gid, action, params, "unsupported",
+                               "no v0 executor for action %s" % action, issuer_model=issuer_model)
+            return "refused"
+        return "information-only"
 
     def _ack(self, env, agent_name):
         try:

@@ -131,3 +131,32 @@ def http(method, url, body=None, headers=None, raw=False):
 
 def signed(obj, seed):
     return envelope.sign_obj(obj, seed)
+
+
+def resource(node, name="ping"):
+    """A resource bound to `node`: host:<node-key>:<name>."""
+    return "host:%s:%s" % (node.node_key, name)
+
+
+def issue_grant(node, agent, principal, scope=None, max_uses=1, executor=None, **kw):
+    """A principal-signed grant for `agent` on `node`, written under the
+    node's grants/ as the CLI would. Default scope: test.ping on this node."""
+    card = node.agents[agent]["card"]
+    scope = scope or [{"action": "test.ping", "resource": resource(node), "params": {}}]
+    g = envelope.make_grant(principal.seed, "p", card, executor or node.node_key, scope, "ping",
+                            max_uses=max_uses, **kw)
+    gdir = os.path.join(node.home, "grants")
+    os.makedirs(gdir, exist_ok=True)
+    json.dump(g, open(os.path.join(gdir, g["grant_id"] + ".json"), "w"))
+    return g
+
+
+def send_action(n_from, agent_from, n_to, agent_to, grant_ids, action="test.ping", res=None, params=None):
+    n_from.queue_send(agent_from, agent_key(n_to, agent_to),
+                      {"kind": "action", "action": action, "resource": res if res is not None else resource(n_to),
+                       "params": {} if params is None else params, "text": action},
+                      grant_ids=list(grant_ids))
+
+
+def uses(node, gid):
+    return node._grant_uses(gid)
