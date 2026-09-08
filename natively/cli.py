@@ -225,13 +225,13 @@ def cmd_bot(args):
     while True:
         try:
             # outbound chatter
-            if peers and random.random() < 0.7:
+            if peers and random.random() < args.peer_prob:
                 txt = " ".join(random.choices(words, k=random.randint(3, 40)))
                 to = _resolve(n, random.choice(peers))
                 n.queue_send(args.agent, to, {"kind": "text", "text": "[%s] %s" % (args.agent, txt)})
             # group chatter
             gdir = os.path.join(n.home, "groups")
-            if os.path.isdir(gdir) and random.random() < 0.3:
+            if os.path.isdir(gdir) and random.random() < args.group_prob:
                 for gf in os.listdir(gdir):
                     txt = " ".join(random.choices(words, k=random.randint(3, 25)))
                     try:
@@ -308,7 +308,7 @@ def main(argv=None):
     p = sub.add_parser("fetch-blob"); p.add_argument("--agent", required=True); p.add_argument("--msg-id", required=True); p.add_argument("--out", required=True); p.set_defaults(f=cmd_fetch_blob)
     p = sub.add_parser("ledger"); p.add_argument("ledger_cmd", choices=["head", "verify", "tail"]); p.add_argument("-n", type=int, default=10); p.set_defaults(f=cmd_ledger)
     p = sub.add_parser("grant-issue"); p.add_argument("--agent", required=True); p.add_argument("--principal", required=True); p.add_argument("--principal-name", default="principal"); p.add_argument("--scope", required=True); p.add_argument("--statement", required=True); p.add_argument("--max-uses", type=int, default=1); p.add_argument("--ttl", type=int, default=86400); p.set_defaults(f=cmd_grant_issue)
-    p = sub.add_parser("bot"); p.add_argument("--agent", required=True); p.add_argument("--peers", default=""); p.add_argument("--blob-rate", type=float, default=0.05); p.add_argument("--min-gap", type=float, default=0.2); p.add_argument("--max-gap", type=float, default=2.0); p.set_defaults(f=cmd_bot)
+    p = sub.add_parser("bot"); p.add_argument("--agent", required=True); p.add_argument("--peers", default=""); p.add_argument("--blob-rate", type=float, default=0.05); p.add_argument("--min-gap", type=float, default=0.2); p.add_argument("--max-gap", type=float, default=2.0); p.add_argument("--peer-prob", type=float, default=0.7); p.add_argument("--group-prob", type=float, default=0.3); p.set_defaults(f=cmd_bot)
 
     args = ap.parse_args(argv)
     args.f(args)
