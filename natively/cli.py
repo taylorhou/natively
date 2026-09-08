@@ -241,6 +241,8 @@ def cmd_bot(args):
                     if not gf.endswith(".json"):
                         continue  # skip .lock files: gf[:-5] on one yields a
                         # mangled gid whose lock file nests .json.json... (#40)
+                    if any(s in gf for s in args.group_skip):
+                        continue  # soak stays off live exchange groups
                     txt = " ".join(random.choices(words, k=random.randint(3, 25)))
                     try:
                         n.group_send(args.agent, gf[:-5], {"kind": "group_text", "text": "[%s] %s" % (args.agent, txt)})
@@ -316,7 +318,7 @@ def main(argv=None):
     p = sub.add_parser("fetch-blob"); p.add_argument("--agent", required=True); p.add_argument("--msg-id", required=True); p.add_argument("--out", required=True); p.set_defaults(f=cmd_fetch_blob)
     p = sub.add_parser("ledger"); p.add_argument("ledger_cmd", choices=["head", "verify", "tail"]); p.add_argument("-n", type=int, default=10); p.set_defaults(f=cmd_ledger)
     p = sub.add_parser("grant-issue"); p.add_argument("--agent", required=True); p.add_argument("--principal", required=True); p.add_argument("--principal-name", default="principal"); p.add_argument("--scope", required=True); p.add_argument("--statement", required=True); p.add_argument("--max-uses", type=int, default=1); p.add_argument("--ttl", type=int, default=86400); p.set_defaults(f=cmd_grant_issue)
-    p = sub.add_parser("bot"); p.add_argument("--agent", required=True); p.add_argument("--peers", default=""); p.add_argument("--blob-rate", type=float, default=0.05); p.add_argument("--min-gap", type=float, default=0.2); p.add_argument("--max-gap", type=float, default=2.0); p.add_argument("--peer-prob", type=float, default=0.7); p.add_argument("--group-prob", type=float, default=0.3); p.set_defaults(f=cmd_bot)
+    p = sub.add_parser("bot"); p.add_argument("--agent", required=True); p.add_argument("--peers", default=""); p.add_argument("--blob-rate", type=float, default=0.05); p.add_argument("--min-gap", type=float, default=0.2); p.add_argument("--max-gap", type=float, default=2.0); p.add_argument("--peer-prob", type=float, default=0.7); p.add_argument("--group-prob", type=float, default=0.3); p.add_argument("--group-skip", default=""); p.set_defaults(f=cmd_bot)
 
     args = ap.parse_args(argv)
     args.f(args)
