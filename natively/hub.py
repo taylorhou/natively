@@ -12,8 +12,8 @@ API (all JSON unless noted):
   POST /v1/msg                {envelope} -> {seq}
   GET  /v1/poll/<node_fp>?after=<seq>  (long-poll, timeout=25s)
                               header X-Natively-Auth: node-signed poll token
-  POST /v1/blob               raw ciphertext body -> {blob_id, size}
-  GET  /v1/blob/<blob_id>     raw ciphertext
+  POST /v1/blob               raw ciphertext body -> {blob_id, size}; 413 over the cap
+  GET  /v1/blob/<blob_id>     raw ciphertext (repeatable: a GET never consumes the blob)
   GET  /v1/healthz
 
 Authentication (review 2026-09-07, point 1): a prekey bundle is stored only
@@ -25,7 +25,10 @@ one; a poll (which reads AND prunes the node's queue) carries a token
 signed by the registered node key. `--principal-pub` restricts
 registration to cards issued by those principals.
 """
+import fcntl
 import json
+import shutil
+import tempfile
 import threading
 import time
 import os
@@ -96,7 +99,15 @@ class State:
         # optional allowlist of principal public keys (b64): when set, only
         # cards issued by these principals register
         self.principal_roots = set(principal_roots or [])
-        self.blob_dir = os.path.join(os.path.dirname(os.path.abspath(path)), "blobs") if path else None
+        # blobs live on disk beside the state file; a hub started without a
+        # state path (the default) still keeps them for its lifetime - in a
+        # private directory of its own under the system temp dir (mode
+        # 0700, never shared with another process or user) - instead of
+        # dropping every upload silently
+        self.blob_dir = (os.path.join(os.path.dirname(os.path.abspath(path)), "blobs") if path
+                         else tempfile.mkdtemp(prefix="natively-hub-blobs-"))
+        self._private_store = not path  # made by mkdtemp for this hub alone: removed when it closes
+        self._blob_dir_ready = False
         self.prekeys = {}       # node_fp -> bundle
         self.nodes = {}         # node_fp -> {name, agents}
         self.agent_dir = {}     # "name@nodefp" -> {agent_key, card, node_fp}
@@ -108,6 +119,7 @@ class State:
         self.conds = {}         # node_fp -> Condition: POST wakes only the target's pollers
         if path and os.path.exists(path):
             self._load()
+        self._blob_store()      # the store is ready and within its cap before any request is served
 
     def _cond(self, fp):
         c = self.conds.get(fp)
@@ -169,31 +181,142 @@ class State:
             return None
         return os.path.join(self.blob_dir, bid)
 
-    def blob_put(self, bid, data):
-        p = self._blob_path(bid)
-        if not p:
-            return
-        os.makedirs(self.blob_dir, exist_ok=True)
-        with open(p, "wb") as f:
-            f.write(data)
-        # fifo evict by mtime when over cap
-        files = sorted((os.path.join(self.blob_dir, x) for x in os.listdir(self.blob_dir)),
-                       key=lambda x: os.path.getmtime(x))
+    @staticmethod
+    def _fsync_dir(d):
+        fd = os.open(d, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    class _store_lock:
+        """The store-wide lock (an flock on <store>/.lock): every writer of
+        this directory - another State in this process, another hub
+        process sharing the volume - serializes its uploads, its temp-file
+        reclaim and its eviction, so nobody removes a file another writer
+        is still publishing."""
+
+        def __init__(self, d):
+            self.d = d
+
+        def __enter__(self):
+            self.f = open(os.path.join(self.d, ".lock"), "w")
+            fcntl.flock(self.f.fileno(), fcntl.LOCK_EX)
+            return self
+
+        def __exit__(self, *a):
+            fcntl.flock(self.f.fileno(), fcntl.LOCK_UN)
+            self.f.close()
+
+    def _evict(self, protect=None):
+        """Under the store lock: retire the oldest blobs (by upload time)
+        until the store is within BLOB_CAP, never `protect` (the blob just
+        written); the directory is fsynced when anything went."""
+        d = self.blob_dir
+        files = sorted((os.path.join(d, x) for x in os.listdir(d) if not x.startswith(".")),
+                       key=lambda x: (os.path.getmtime(x), x))
         total = sum(os.path.getsize(x) for x in files)
+        evicted = False
         for x in files:
             if total <= self.BLOB_CAP:
                 break
+            if x == protect:
+                continue  # never the blob just written, whatever its mtime says
             total -= os.path.getsize(x)
-            os.unlink(x)
+            os.remove(x)
+            evicted = True
+        if evicted:
+            self._fsync_dir(d)  # the retirements are durable too: a restart never comes back over the cap
 
-    def blob_take(self, bid):
+    def _blob_store(self):
+        """The store directory, private to this hub (0700) and durably
+        created. On first use, under the store lock: leftover temp files
+        from an upload that died mid-write are reclaimed, and the store is
+        brought within its cap (an upload whose final fsync failed may
+        have left it over)."""
+        if self._blob_dir_ready:
+            return
+        d = self.blob_dir
+        os.makedirs(d, mode=0o700, exist_ok=True)  # another State or process may be creating it right now
+        # the parent is fsynced on every first use, created just now or
+        # not: a parent fsync that failed on an earlier attempt is retried
+        # here, never skipped because the directory happens to exist
+        self._fsync_dir(os.path.dirname(os.path.abspath(d)))
+        st = os.stat(d)
+        if st.st_uid != os.getuid() or (st.st_mode & 0o077):
+            raise PermissionError("blob store %s must be owned by this user and private (mode 0700)" % d)
+        with self._store_lock(d):
+            for x in os.listdir(d):
+                if x.startswith(".blob."):
+                    try:
+                        os.remove(os.path.join(d, x))  # nobody else holds the lock: no upload is mid-flight
+                    except OSError:
+                        pass
+            self._evict()
+        self._blob_dir_ready = True
+
+    def blob_put(self, bid, data) -> str:
+        """Store a blob durably (temp file, every byte written and fsynced,
+        rename, the directory fsynced) under its id. Returns '' or the
+        reason it was refused. Blobs are content-addressed, so a second
+        upload of the same bytes is the same blob. The store is bounded by
+        BLOB_CAP: when the new blob would not fit, the OLDEST blobs (by
+        upload time) are retired first, and never the one just written; a
+        blob larger than the whole cap is refused."""
         p = self._blob_path(bid)
-        if not p or not os.path.exists(p):
+        if not p:
+            return "bad blob id"
+        if len(data) > self.BLOB_CAP:
+            return "blob larger than the store"
+        with self.lock:
+            self._blob_store()
+            with self._store_lock(self.blob_dir):
+                fd, tmp = tempfile.mkstemp(dir=self.blob_dir, prefix=".blob.")
+                try:
+                    with os.fdopen(fd, "wb") as f:  # writes every byte, or raises
+                        f.write(data)
+                        f.flush()
+                        os.fsync(f.fileno())
+                    os.replace(tmp, p)
+                except BaseException:
+                    try:
+                        os.remove(tmp)  # an upload that failed leaves nothing behind
+                    except OSError:
+                        pass
+                    raise
+                # the blob is published from here on: whatever fails after
+                # this point, the cap is still enforced, then reported
+                published_error = None
+                try:
+                    os.utime(p)  # a re-upload is a fresh copy: it lives as long as the newest
+                    self._fsync_dir(self.blob_dir)  # the directory entry is durable, not only the bytes
+                except OSError as e:
+                    published_error = e
+                self._evict(protect=p)
+                if published_error is not None:
+                    raise published_error
+        return ""
+
+    def blob_get(self, bid):
+        """The blob's bytes, or None. A read does not consume it: the same
+        blob can be fetched again by every recipient it was sent to, and by
+        one recipient whose first download failed after the hub answered.
+        Retention is the cap above, never the first GET."""
+        p = self._blob_path(bid)
+        if not p:
             return None
-        with open(p, "rb") as f:
-            d = f.read()
-        os.unlink(p)
-        return d
+        self._blob_store()  # a hub that only serves downloads after a crash still reclaims and reconciles
+        try:
+            with open(p, "rb") as f:
+                return f.read()
+        except FileNotFoundError:
+            return None
+
+    def close(self):
+        """A stateless hub's private store goes with it: nothing else can
+        reach those blobs once the process is gone."""
+        if self._private_store and os.path.isdir(self.blob_dir):
+            shutil.rmtree(self.blob_dir, ignore_errors=True)
 
     def save(self, force=False):
         if not self.path:
@@ -329,7 +452,7 @@ def make_server(port: int, state: State):
                 bid = p.rsplit("/", 1)[1]
                 if not envelope.safe_fp(bid):
                     return self._json(400, {"error": "bad blob id"})
-                d = st.blob_take(bid)  # one-shot fetch; file store, no lock held
+                d = st.blob_get(bid)  # a read, never a take: the blob stays for every recipient
                 return self._raw(200, d) if d is not None else self._json(404, {"error": "no blob"})
             if p.startswith("/v1/poll/"):
                 rest = p[len("/v1/poll/"):]
@@ -532,7 +655,9 @@ def make_server(port: int, state: State):
                     return self._json(413, {"error": "too big"})
                 import hashlib
                 bid = hashlib.sha256(b).hexdigest()[:32]
-                st.blob_put(bid, b)  # file store on the volume, not the json state
+                why = st.blob_put(bid, b)  # file store on the volume, not the json state
+                if why:
+                    return self._json(413, {"error": why})
                 return self._json(200, {"blob_id": bid, "size": len(b)})
             return self._json(404, {"error": "not found"})
 
@@ -541,6 +666,9 @@ def make_server(port: int, state: State):
 
 def run(port=8471, state_path=None, principal_roots=None):
     st = State(state_path, principal_roots=principal_roots)
-    srv = make_server(port, st)
-    print("natively hub listening on :%d" % port)
-    srv.serve_forever()
+    try:
+        srv = make_server(port, st)  # inside the cleanup scope: a port already taken never leaks a private store
+        print("natively hub listening on :%d" % port)
+        srv.serve_forever()
+    finally:
+        st.close()
