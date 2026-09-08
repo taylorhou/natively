@@ -298,6 +298,12 @@ class SenderKey:
                 self.chain_key, mk = kdf_chain(self.chain_key)
                 self.skipped[self.n] = mk
                 self.n += 1
+            # the store is bounded across gaps, not only per gap: the oldest
+            # keys go first (their messages are the least likely to still
+            # arrive), so a persisted state never outgrows what from_state
+            # accepts
+            while len(self.skipped) > self.MAX_SKIP:
+                del self.skipped[min(self.skipped)]
         self.chain_key, mk = kdf_chain(self.chain_key)
         self.n += 1
         return aead_decrypt(mk, ct, aad)
@@ -308,6 +314,33 @@ class SenderKey:
 
     @classmethod
     def from_state(cls, st):
-        s = cls(b64d(st["ck"]), st["n"])
-        s.skipped = {int(k): b64d(v) for k, v in st.get("skipped", {}).items()}
+        """A SenderKey from state(). Any other shape is CryptoError: a
+        32-byte chain key, a non-negative integer counter, and skipped
+        keys of 32 bytes under integer indexes. A counter that is not an
+        integer would otherwise install fine and fail at the first
+        decrypt, after a grant use was spent on the join. A state written
+        before the store was bounded may hold more than MAX_SKIP skipped
+        keys: it loads, keeping the newest MAX_SKIP, never disabling the
+        group."""
+        try:
+            if not isinstance(st, dict) or not set(st) <= {"ck", "n", "skipped"}:
+                raise ValueError
+            ck, n = b64d(st["ck"]), st["n"]
+            if len(ck) != 32 or isinstance(n, bool) or not isinstance(n, int) or n < 0:
+                raise ValueError
+            raw = st.get("skipped", {})
+            if not isinstance(raw, dict):
+                raise ValueError
+            skipped = {}
+            for k, v in raw.items():
+                i, mk = int(k), b64d(v)
+                if i < 0 or len(mk) != 32:
+                    raise ValueError
+                skipped[i] = mk
+        except Exception:
+            raise CryptoError("not a sender-key state")
+        for i in sorted(skipped)[:max(0, len(skipped) - cls.MAX_SKIP)]:
+            del skipped[i]
+        s = cls(ck, n)
+        s.skipped = skipped
         return s
