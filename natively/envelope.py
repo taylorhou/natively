@@ -54,9 +54,17 @@ def obj_hash(obj: dict) -> str:
 
 def make_card(agent_seed: bytes, node_pub: bytes, principal_seed: bytes,
               capabilities, ledger_url, ttl_s=30 * 86400, supersedes=None) -> dict:
+    return make_card_for_pub(crypto.sign_pub(agent_seed), node_pub, principal_seed,
+                             capabilities, ledger_url, ttl_s, supersedes)
+
+
+def make_card_for_pub(agent_pub: bytes, node_pub: bytes, principal_seed: bytes,
+                      capabilities, ledger_url, ttl_s=30 * 86400, supersedes=None) -> dict:
+    # Same card as make_card, but for an agent keypair generated elsewhere:
+    # only the public key crosses, so the agent's seed never leaves its node.
     card = {
         "card_version": 1,
-        "agent_key": "ed25519:" + crypto.b64e(crypto.sign_pub(agent_seed)),
+        "agent_key": "ed25519:" + crypto.b64e(agent_pub),
         "node_key": "ed25519:" + crypto.b64e(node_pub),
         "principal_key_ref": "ed25519:" + crypto.b64e(crypto.sign_pub(principal_seed)),
         "capabilities": sorted(capabilities),

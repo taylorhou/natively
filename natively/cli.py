@@ -51,6 +51,26 @@ def cmd_agent_add(args):
     print("agent %s added: %s" % (args.name, key))
 
 
+def cmd_card_sign(args):
+    # Sign a card for an agent keypair generated on ANOTHER node: the agent's
+    # seed never leaves its home - only its public key crosses. Lets the
+    # principal seed live on one durable box while agents run anywhere.
+    agent_pub = crypto.b64d(args.agent_pub.split(":", 1)[-1])
+    node_pub = crypto.b64d(args.node_pub.split(":", 1)[-1])
+    card = envelope.make_card_for_pub(
+        agent_pub, node_pub, _principal_seed(args.principal),
+        args.caps.split(",") if args.caps else ["test.ping", "msg.send"],
+        args.ledger_url or "")
+    out = json.dumps(card, indent=2)
+    if args.out:
+        with open(args.out, "w") as f:
+            f.write(out)
+        os.chmod(args.out, 0o600)
+        print("card written to", args.out)
+    else:
+        print(out)
+
+
 def cmd_directory(args):
     n = nodemod.Node(_home(args))
     import urllib.request
@@ -275,6 +295,7 @@ def main(argv=None):
     p = sub.add_parser("node-init"); p.add_argument("--name", required=True); p.add_argument("--hub", required=True); p.add_argument("--principal-pub", required=True); p.set_defaults(f=cmd_node_init)
     p = sub.add_parser("node-run"); p.set_defaults(f=cmd_node_run)
     p = sub.add_parser("agent-add"); p.add_argument("--name", required=True); p.add_argument("--principal", required=True); p.add_argument("--caps", default=""); p.set_defaults(f=cmd_agent_add)
+    p = sub.add_parser("card-sign"); p.add_argument("--agent-pub", required=True); p.add_argument("--node-pub", required=True); p.add_argument("--principal", required=True); p.add_argument("--caps", default=""); p.add_argument("--ledger-url", default=""); p.add_argument("--out"); p.set_defaults(f=cmd_card_sign)
     p = sub.add_parser("directory"); p.set_defaults(f=cmd_directory)
     p = sub.add_parser("send"); p.add_argument("--from", dest="frm", required=True); p.add_argument("--to", required=True); p.add_argument("--text", required=True); p.add_argument("--action"); p.add_argument("--resource"); p.add_argument("--params"); p.add_argument("--grants"); p.set_defaults(f=cmd_send)
     p = sub.add_parser("blob"); p.add_argument("--from", dest="frm", required=True); p.add_argument("--to", required=True); p.add_argument("--file", required=True); p.set_defaults(f=cmd_blob)
