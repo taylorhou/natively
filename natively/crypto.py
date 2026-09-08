@@ -315,17 +315,34 @@ class SenderKey:
     """Per-(group, sender) hash-ratchet sender key."""
 
     MAX_SKIP = 200
+    # Message keys of counters already read are kept (the newest RECENT):
+    # a second copy of the same message - another recipient's relay on
+    # this node, a re-split fan-out, a copy that arrives after a restart -
+    # opens again under the key that read it, and the chain never moves
+    # for it. The same key opens only the same ciphertext (the AEAD tag
+    # binds it), so nothing a holder did not send at that counter opens.
+    RECENT = 64
 
     def __init__(self, chain_key: bytes = None, n: int = 0):
         self.chain_key = chain_key or os.urandom(32)
         self.n = n
         self.skipped = {}  # n -> message key (out-of-order window)
+        self.recent = {}   # n -> message key of a counter already read
 
     def encrypt(self, pt: bytes, aad: bytes = b""):
         self.chain_key, mk = kdf_chain(self.chain_key)
         ct = aead_encrypt(mk, pt, aad)
         n, self.n = self.n, self.n + 1
+        self._remember(n, mk)  # the sender can reopen its own newest RECENT messages (a relay looped back to a member that moved here)
         return n, ct
+
+    def reopen(self, n: int, ct: bytes, aad: bytes = b""):
+        """A message this key already produced or read, opened again under
+        the message key retained for it; the chain never moves. Anything
+        this key has no retained key for is CryptoError."""
+        if not isinstance(n, int) or isinstance(n, bool) or n not in self.recent:
+            raise CryptoError("no retained key for sender-key message %r" % (n,))
+        return aead_decrypt(self.recent[n], ct, aad)
 
     # beyond MAX_SKIP the skipped-key store would grow unboundedly; beyond
     # MAX_FFWD the gap is adversarial and refused. Between them the relay's
@@ -343,10 +360,13 @@ class SenderKey:
             raise CryptoError("bad sender-key index")
         if n in self.skipped:
             pt = aead_decrypt(self.skipped[n], ct, aad)
-            del self.skipped[n]
+            self._remember(n, self.skipped.pop(n))
             return pt
         if n < self.n:
-            raise CryptoError("replayed/old sender-key message")
+            mk = self.recent.get(n)
+            if mk is None:
+                raise CryptoError("replayed/old sender-key message")
+            return aead_decrypt(mk, ct, aad)  # a counter already read: the retained key, the chain untouched
         if n - self.n > self.MAX_FFWD:
             raise CryptoError("sender-key gap beyond fast-forward bound")
         ck, cur, stored = self.chain_key, self.n, {}
@@ -372,11 +392,18 @@ class SenderKey:
         # accepts
         while len(self.skipped) > self.MAX_SKIP:
             del self.skipped[min(self.skipped)]
+        self._remember(n, mk)
         return pt
+
+    def _remember(self, n, mk):
+        self.recent[n] = mk
+        while len(self.recent) > self.RECENT:
+            del self.recent[min(self.recent)]  # the oldest first: its other copies are the least likely still to come
 
     def state(self):
         return {"ck": b64e(self.chain_key), "n": self.n,
-                "skipped": {str(k): b64e(v) for k, v in self.skipped.items()}}
+                "skipped": {str(k): b64e(v) for k, v in self.skipped.items()},
+                "recent": {str(k): b64e(v) for k, v in self.recent.items()}}
 
     @classmethod
     def from_state(cls, st):
@@ -389,24 +416,31 @@ class SenderKey:
         keys: it loads, keeping the newest MAX_SKIP, never disabling the
         group."""
         try:
-            if not isinstance(st, dict) or not set(st) <= {"ck", "n", "skipped"}:
+            if not isinstance(st, dict) or not set(st) <= {"ck", "n", "skipped", "recent"}:
                 raise ValueError
             ck, n = b64d(st["ck"]), st["n"]
             if len(ck) != 32 or isinstance(n, bool) or not isinstance(n, int) or n < 0:
                 raise ValueError
-            raw = st.get("skipped", {})
-            if not isinstance(raw, dict):
-                raise ValueError
-            skipped = {}
-            for k, v in raw.items():
-                i, mk = int(k), b64d(v)
-                if i < 0 or len(mk) != 32:
+            stores = {}
+            for field in ("skipped", "recent"):
+                raw = st.get(field, {})
+                if not isinstance(raw, dict):
                     raise ValueError
-                skipped[i] = mk
+                keys = {}
+                for k, v in raw.items():
+                    i, mk = int(k), b64d(v)
+                    if i < 0 or len(mk) != 32:
+                        raise ValueError
+                    keys[i] = mk
+                stores[field] = keys
         except Exception:
             raise CryptoError("not a sender-key state")
+        skipped, recent = stores["skipped"], stores["recent"]
         for i in sorted(skipped)[:max(0, len(skipped) - cls.MAX_SKIP)]:
             del skipped[i]
+        for i in sorted(recent)[:max(0, len(recent) - cls.RECENT)]:
+            del recent[i]
         s = cls(ck, n)
         s.skipped = skipped
+        s.recent = recent
         return s
