@@ -19,6 +19,13 @@ from .ledger import Ledger
 
 P = 5  # poll interval seconds (spec 4 sizing: ack_deadline 2P+jitter, retries 2P/4P/8P)
 
+# A send whose recipient is not in the hub directory waits - the agent
+# may simply not have registered yet. But post-prune (#43) a dead
+# identity never comes back, and an infinite deferral class churns the
+# outbox forever (96 carried 24k such files on 2026-09-08). Deferrals
+# are terminal after this many seconds.
+DEFER_UNKNOWN_TTL = 1800
+
 
 def home_dir() -> str:
     return os.environ.get("NATIVELY_HOME", os.path.expanduser("~/.natively"))
@@ -663,12 +670,38 @@ class Node:
                                    "msg.send", {"to": req["to"], "msg_id": env["msg_id"]}, "queued",
                                    "sent %s to %s" % (req["body_obj"].get("kind", "msg"), req["to"]))
                 os.unlink(path)
+                if self.state.get("deferred_since", {}).pop(f, None) is not None:
+                    dirty = True
                 outcomes += 1
             except Exception as e:
                 transient = isinstance(e, (urllib.error.URLError, TimeoutError, OSError, IdentityUnknown, RecipientMoved))
                 if isinstance(e, urllib.error.HTTPError) and 400 <= e.code < 500:
                     transient = False  # 4xx is a permanent rejection, not a retry case
-                if transient:
+                if transient and isinstance(e, IdentityUnknown):
+                    # Recipient not in the directory: retryable while it
+                    # may still register, terminal after DEFER_UNKNOWN_TTL
+                    # (a pruned identity never resolves - #43 made this an
+                    # infinite class; fleet measured +2.5k churning files
+                    # in 30 min on 96).
+                    ds = self.state.setdefault("deferred_since", {})
+                    first = ds.get(f)
+                    if first is None:
+                        ds[f] = time.time()
+                        dirty = True
+                        self.ledger.append("node:%s" % self.name, None, "msg.send", {"file": f},
+                                           "retry", "send deferred: %s" % e)
+                    elif time.time() - first > DEFER_UNKNOWN_TTL:
+                        ds.pop(f, None)
+                        dirty = True
+                        self.ledger.append("agent:%s" % req["from_agent"], None, "msg.send",
+                                           {"file": f, "to": req.get("to")}, "recipient-unknown",
+                                           "terminal: recipient not in the directory for >%ds" % DEFER_UNKNOWN_TTL)
+                        os.rename(path, path + ".err")
+                        outcomes += 1
+                    else:
+                        self.ledger.append("node:%s" % self.name, None, "msg.send", {"file": f},
+                                           "retry", "send deferred: %s" % e)
+                elif transient:
                     # hub down / network blip: leave in outbox, retry next pass
                     self.ledger.append("node:%s" % self.name, None, "msg.send", {"file": f},
                                        "retry", "send deferred: %s" % e)
