@@ -693,6 +693,23 @@ class Node:
                                 "creator": body.get("sender_fp"), "members": body.get("members", []),
                                 "_send": crypto.SenderKey(), "_recv": {},
                                 "send_state": None, "recv_states": {}}
+        else:
+            # Member-add via redistribution: a group_key whose member list is
+            # a STRICT SUPERSET of ours adopts it - the list is otherwise
+            # frozen at join and there is no other add path (found in the
+            # plane-test-1 soak: nmbp onboarded mid-group and existing
+            # members never fanned out to it). Shrinks and rewrites are
+            # ignored: a stale or hostile smaller list must never silently
+            # drop members from our fan-out.
+            g0 = self.groups[gid]
+            body_keys = {m.get("agent_key") for m in body.get("members", [])}
+            local_keys = {m.get("agent_key") for m in g0.get("members", [])}
+            if body_keys > local_keys:
+                g0["members"] = body["members"]
+                self._save_group(gid)
+                self.ledger.append("agent:%s" % agent_name, None, "group.members",
+                                   {"group_id": gid}, "updated",
+                                   "members %d -> %d via redistribution" % (len(local_keys), len(body_keys)))
         # A re-delivered group_key (unacked retry, hub replay) carries the
         # sender's INITIAL ratchet state. Applying it rewinds our recv chain
         # and every newer group text then rejects as 'replayed/old'. Only
