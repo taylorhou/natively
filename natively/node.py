@@ -411,7 +411,15 @@ class Node:
 
     def _flush_outbox(self):
         dead = {}  # recipient -> permanent identity verdict, this pass
+        dirty = False  # state changed; saved once at pass end, not per send
+        outcomes = 0
+        # Cap outcomes per pass: during a deep backlog the pass must not
+        # starve the poll side - inbound latency matters more than drain
+        # speed, and the remaining files are picked up next pass.
+        FLUSH_BATCH = 400
         for i, f in enumerate(sorted(os.listdir(self.outbox_dir))):
+            if outcomes >= FLUSH_BATCH:
+                break
             if i and i % 200 == 0:
                 self._maybe_reregister()
             if not f.endswith(".json"):
@@ -428,6 +436,7 @@ class Node:
                     self.ledger.append("node:%s" % self.name, None, "msg.send", {"file": f},
                                        "error", "send failed: recipient identity: %s (same-pass verdict)" % dead[req["to"]])
                     os.rename(path, path + ".err")
+                    outcomes += 1
                     continue
                 if req["from_agent"] not in self._last_registered:
                     # an agent added since the last successful registration:
@@ -493,11 +502,12 @@ class Node:
                 self.state["unacked"][env["msg_id"]] = {
                     "env": env, "attempts": 1, "next": time.time() + 2 * P,
                     "peer_fp": peer_fp}
-                self._save_state()
+                dirty = True  # saved once at pass end; a crash costs at most a duplicate send, and apply is idempotent on msg_id
                 self.ledger.append("agent:%s" % req["from_agent"], req["grant_ids"][0] if req["grant_ids"] else None,
                                    "msg.send", {"to": req["to"], "msg_id": env["msg_id"]}, "queued",
                                    "sent %s to %s" % (req["body_obj"].get("kind", "msg"), req["to"]))
                 os.unlink(path)
+                outcomes += 1
             except Exception as e:
                 transient = isinstance(e, (urllib.error.URLError, TimeoutError, OSError, IdentityUnknown, RecipientMoved))
                 if isinstance(e, urllib.error.HTTPError) and 400 <= e.code < 500:
@@ -510,6 +520,9 @@ class Node:
                     self.ledger.append("node:%s" % self.name, None, "msg.send", {"file": f},
                                        "error", "send failed: %s" % e)
                     os.rename(path, path + ".err")
+                    outcomes += 1
+        if dirty:
+            self._save_state()
 
     # ---------- receive path ----------
     def _handle_envelope(self, env):
