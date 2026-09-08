@@ -3,6 +3,7 @@
 All signed objects are JCS-canonicalized JSON, signed over the canonical
 form minus the `sig` field. Bodies are base64 ciphertext (suite nv1).
 """
+import re
 import time
 
 from . import jcs, crypto
@@ -27,6 +28,27 @@ def _ulid():
 
 def new_id(prefix: str) -> str:
     return "%s_%s" % (prefix, _ulid())
+
+
+# Crockford base32 as _ulid emits it: digits and lowercase letters minus i, l, o, u
+_ID_RE = re.compile(r"[a-z]{3}_[0-9a-hjkmnp-tv-z]{26}")
+_HEX32_RE = re.compile(r"[0-9a-f]{32}")
+
+
+def safe_id(s, prefix: str = None) -> bool:
+    """Is `s` a protocol identifier (`<3 lowercase letters>_<26 Crockford
+    base32>`, e.g. msg_..., grt_..., grp_...)? Every identifier that
+    arrives over the wire or out of a decrypted body is checked with this
+    before it names a file, a dict key or a ledger row. A prefix pins the
+    kind. fullmatch: no trailing newline or any other extra byte."""
+    if not isinstance(s, str) or _ID_RE.fullmatch(s) is None:
+        return False
+    return prefix is None or s.startswith(prefix + "_")
+
+
+def safe_fp(s) -> bool:
+    """Is `s` a node fingerprint / blob id (exactly 32 lowercase hex)?"""
+    return isinstance(s, str) and _HEX32_RE.fullmatch(s) is not None
 
 
 def now_iso() -> str:

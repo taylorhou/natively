@@ -207,6 +207,8 @@ class Node:
         self.agents = agents
 
     def _session_path(self, direction, peer_fp):
+        if not envelope.safe_fp(peer_fp):
+            raise ValueError("bad peer fingerprint")
         return os.path.join(self.home, "sessions", direction + "_" + peer_fp + ".json")
 
     def _session(self, direction, peer_fp):
@@ -240,6 +242,8 @@ class Node:
         return self._group(gid)
 
     def _group_path(self, gid):
+        if not envelope.safe_id(gid, "grp"):
+            raise ValueError("bad group id")
         return os.path.join(self.home, "groups", gid + ".json")
 
     def _group(self, gid):
@@ -665,6 +669,10 @@ class Node:
 
     # ---------- receive path ----------
     def _handle_envelope(self, env):
+        if not envelope.safe_id(env.get("msg_id"), "msg"):
+            self.ledger.append("node:%s" % self.name, None, "msg.recv", {}, "rejected-bad-id",
+                               "msg_id is not an identifier")
+            return
         if not envelope.verify_message(env):
             self.ledger.append("node:%s" % self.name, None, "msg.recv",
                                {"msg_id": env.get("msg_id")}, "rejected-bad-sig",
@@ -722,7 +730,13 @@ class Node:
         self._ack(env, agent_name)
 
     def _handle_group_key(self, agent_name, env, body, ack=True):
-        with self._group_lock(body["group_id"]):
+        gid = body.get("group_id")
+        if not envelope.safe_id(gid, "grp"):
+            # a decrypted group_id names the group file: only the id grammar
+            self.ledger.append("agent:%s" % agent_name, None, "group.key",
+                               {"msg_id": env["msg_id"]}, "rejected-bad-id", "group_id is not an identifier")
+            return
+        with self._group_lock(gid):
             return self._handle_group_key_locked(agent_name, env, body, ack=ack)
 
     def _handle_group_key_locked(self, agent_name, env, body, ack=True):
@@ -788,6 +802,10 @@ class Node:
             return
         if kind == "group_relay":
             wire = body["wire"]
+            if not envelope.safe_id(wire.get("group_id"), "grp"):
+                self.ledger.append("agent:%s" % agent_name, None, "group.recv",
+                                   {"msg_id": env["msg_id"]}, "rejected-bad-id", "group_id is not an identifier")
+                return
             g = self._group(wire["group_id"])
             if g is None:
                 self.ledger.append("agent:%s" % agent_name, None, "group.recv",
@@ -812,7 +830,9 @@ class Node:
         outcome = "delivered"
         if env.get("grant_ids"):
             outcome = self._apply_grants(env, agent_name, body)
-        self.ledger.append("agent:%s" % agent_name, (env.get("grant_ids") or [None])[0],
+        # the receive row names the first WELL-FORMED grant id, or none
+        gids = [g for g in (env.get("grant_ids") or []) if envelope.safe_id(g, "grt")]
+        self.ledger.append("agent:%s" % agent_name, gids[0] if gids else None,
                            "msg.recv", {"msg_id": env["msg_id"], "from": env["from"], "kind": kind},
                            outcome, "received %s from %s" % (kind, env["from"]))
 
@@ -821,13 +841,28 @@ class Node:
         supports test.ping only; everything else refuses (spec 1: failure
         is shown)."""
         acted = "information-only"
+        seen_ids = set()
         for gid in env.get("grant_ids", []):
+            # the id names the grant file: only the id grammar reaches a
+            # path, and a grant is accounted under its own signed grant_id,
+            # never under whatever alias the sender wrote
+            if not envelope.safe_id(gid, "grt"):
+                self.ledger.append("agent:%s" % agent_name, None, "grant.check",
+                                   {"msg_id": env["msg_id"]}, "rejected-bad-id", "grant id is not an identifier")
+                continue
+            if gid in seen_ids:
+                continue  # listed twice: one grant, one check, one use
+            seen_ids.add(gid)
             gpath = os.path.join(self.home, "grants", gid + ".json")
             if not os.path.exists(gpath):
                 self.ledger.append("agent:%s" % agent_name, gid, "grant.check", {}, "unknown-grant",
                                    "grant %s not held locally" % gid)
                 continue
             g = json.load(open(gpath))
+            if not isinstance(g, dict) or g.get("grant_id") != gid:
+                self.ledger.append("agent:%s" % agent_name, gid, "grant.check", {}, "invalid",
+                                   "grant file does not carry this grant_id")
+                continue
             try:
                 # a grant counts when its issuer is any pinned root (own
                 # principal.pub or an installed principals/<name>.pub) -
@@ -1007,6 +1042,13 @@ class Node:
                 env = item.get("env", item)  # tolerate legacy unwrapped rows
                 seq = item.get("_seq", 0)
                 mid = env.get("msg_id")
+                if not envelope.safe_id(mid, "msg"):
+                    # a wire msg_id names the inbox file and the seen set:
+                    # only the id grammar gets that far
+                    self.ledger.append("node:%s" % self.name, None, "msg.recv",
+                                       {"seq": seq}, "rejected-bad-id", "msg_id is not an identifier")
+                    self.state["last_seq"] = max(self.state["last_seq"], seq)
+                    continue
                 if mid in self.state["seen"]:
                     self.state["last_seq"] = max(self.state["last_seq"], seq)
                     continue
