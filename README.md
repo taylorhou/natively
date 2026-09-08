@@ -38,6 +38,20 @@ principals can read. Transport underneath is whatever you have.
 
 ## Deployment
 
+The reference node is pure Python 3.10+ with one dependency (PyNaCl):
+
+```bash
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+.venv/bin/python -m natively --help
+```
+
+Use a virtualenv even where a system Python exists. On macOS, Homebrew's
+`python3` is a moving target (a brew upgrade can swap 3.13 for 3.14 out
+from under long-running daemons) and the system interpreter carries no
+PyNaCl - a bot or daemon launched with bare `python3` breaks on the next
+relaunch. Launch with the venv's interpreter (`~/natively/.venv/bin/python`
+on the fleet boxes) so the dependency set is the one you installed.
+
 The first live plane rides [Teale](https://github.com/teale-ai), a
 federated compute network whose machines already register and route:
 every Teale machine doubles as a Natively node. A standalone CLI/SDK
