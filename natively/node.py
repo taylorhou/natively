@@ -632,6 +632,12 @@ class Node:
         _t0 = time.monotonic()
         _save0 = self._diag_save_ms
         dead = {}  # recipient -> permanent identity verdict, this pass
+        unknown_rcpts = set()  # recipients already proven absent from the directory THIS PASS:
+        # _peer_card re-checks a cached-directory miss against the hub (fresh fetch), so without
+        # this set EVERY queued file to a pruned recipient costs one directory round trip per pass
+        # - 200 ghost files in the drain slice meant 200 fetches x ~140ms ~= 28s of collect per
+        # pass on air (2026-09-09), compounding with the 1s positive-cache TTL. A peer that
+        # registers mid-pass is picked up next pass; the deferral path is unchanged.
         dirty = False  # state changed; saved once at pass end, not per send
         outcomes = 0
         # Cap outcomes per pass: during a deep backlog the pass must not
@@ -716,6 +722,8 @@ class Node:
                     continue  # its key distribution is waiting on the hub: this file waits behind it (no attempt spent)
                 if self._rcpt_backoff.get(_bare_key(req.get("to")), (0.0,))[0] > now:
                     continue  # first read of a file to a refused recipient: it spends no budget either
+                if req["to"] in unknown_rcpts:
+                    raise IdentityUnknown("recipient absent from the directory (this pass)")
                 if req["to"] in dead:
                     # a recipient already found permanently undeliverable in
                     # this pass (e.g. card principal not in the pinned root
@@ -739,6 +747,7 @@ class Node:
                 try:
                     _, peer_fp = self._peer_card(req["to"])
                 except IdentityUnknown:
+                    unknown_rcpts.add(req["to"])
                     raise
                 except IdentityError as e:
                     dead[req["to"]] = str(e)
