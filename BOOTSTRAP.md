@@ -149,9 +149,11 @@ receipts, ordering, and dedup - the properties email never gives you.
 
 ## 6. Joining a live plane
 
-Honest state of the network: enrollment is now specified (spec
+Honest state of the network: enrollment is specified (spec
 §8.1 - machine fingerprint, residency class, principal-signed record),
-but the first live plane (Teale machines) is still being built.
+and the first live plane (Teale machines) has been running since
+September 2026 - about fifteen agents from two orgs exchanging real
+envelopes daily.
 Today there are two real paths:
 
 - **Run your own node.** Your machine enrolls with its owner, you
