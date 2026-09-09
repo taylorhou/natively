@@ -181,6 +181,16 @@ class _GroupFileLock:
 
 
 class Node:
+    FLUSH_BATCH = 800   # outcomes+dispatches per flush pass
+    LIVE_WINDOW = 600   # newest eligible files sent first each pass
+    DRAIN_SLICE = 200   # guaranteed oldest eligible slice per pass
+    RECV_BATCH = 64     # inbound messages handled per step: the hub's poll
+    # returns the whole waiting backlog with no page cap, and receive-path
+    # work is ~0.3-0.6s per message (crypto + session save + ack + inbox
+    # write) - an inbound flood otherwise monopolizes the loop for minutes
+    # and the flush side starves (air, 2026-09-09: ms_poll 109-202s/step,
+    # drain -23/min net against a 39k backlog)
+
     def __init__(self, home=None):
         self.home = home or home_dir()
         self.cfg = json.load(open(os.path.join(self.home, "config.json")))
@@ -627,13 +637,13 @@ class Node:
         # Cap outcomes per pass: during a deep backlog the pass must not
         # starve the poll side - inbound latency matters more than drain
         # speed, and the remaining files are picked up next pass.
-        FLUSH_BATCH = 400
+        FLUSH_BATCH = self.FLUSH_BATCH
         # Two-phase order. Live traffic is the newest files; dead backlog is
         # the oldest. Newest-first alone would starve the drain whenever
         # arrivals fill the cap; oldest-first makes live sends queue behind
-        # thousands of verdict marks. So: a live window of the newest 300,
-        # then a guaranteed oldest slice of 100 - live latency wins the
-        # budget, the backlog drains at a steady floor.
+        # thousands of verdict marks. So: a live window of the newest
+        # LIVE_WINDOW, then a guaranteed oldest slice of DRAIN_SLICE - live
+        # latency wins the budget, the backlog drains at a steady floor.
         files = [f for f in sorted(os.listdir(self.outbox_dir)) if f.endswith(".json")]
         n_files = len(files)
         # Eligibility is decided BEFORE the windows are cut: a file the hub
@@ -670,7 +680,7 @@ class Node:
         files = [f for f in files if self._backoff.get(f, (0.0, 0.0))[0] <= now
                  and self._rcpt_backoff.get(self._file_to.get(f), (0.0,))[0] <= now
                  and not (self._file_to.get(f) in held_to and _kind(f) != "group_key")]
-        order = files[-300:][::-1] + files[:-300][:100]
+        order = files[-self.LIVE_WINDOW:][::-1] + files[:-self.LIVE_WINDOW][:self.DRAIN_SLICE]
         # Causal priority within the pass: a group_key distribution installs
         # the receive state later group_relay messages decrypt under. Pure
         # newest-first delivers a relay BEFORE its key when both were queued
@@ -1488,6 +1498,7 @@ class Node:
     def step(self):
         """One pass: reload agents, flush the outbox, poll once, retry."""
         _s0 = time.monotonic()
+        n_polled = -1
         self._load_agents()  # hot-reload: agent-add must not need a daemon restart
         self._maybe_reregister()
         if not self._last_reg_time:
@@ -1499,7 +1510,12 @@ class Node:
             _, b = self._hub_req("GET", "/v1/poll/%s?after=%d" % (self.fp, after),
                                  headers={"X-Natively-Auth": self._auth_token("poll", after=after)})
             d = json.loads(b)
-            for item in d.get("messages", []):
+            batch = d.get("messages", [])
+            n_polled = len(batch)
+            # Handle at most RECV_BATCH per step; the hub prunes only at the
+            # cursor, so the unhandled tail (seq > last_seq after the slice)
+            # stays queued and comes back on the next poll.
+            for item in batch[:self.RECV_BATCH]:
                 env = item.get("env", item)  # tolerate legacy unwrapped rows
                 seq = item.get("_seq", 0)
                 mid = env.get("msg_id")
@@ -1548,7 +1564,8 @@ class Node:
         _diag(self.home, "step",
               {"ms_flush": round((_s1 - _s0) * 1000),
                "ms_poll": round((_s2 - _s1) * 1000),
-               "ms_retry": round((time.monotonic() - _s2) * 1000)})
+               "ms_retry": round((time.monotonic() - _s2) * 1000),
+               "polled": n_polled, "handled": min(n_polled, self.RECV_BATCH) if n_polled >= 0 else -1})
 
 
 def init_node(home, name, hub_url, principal_pub_b64):
