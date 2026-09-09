@@ -96,3 +96,25 @@ def test_a_429_waits_the_whole_recipient_and_a_landed_send_clears_it(tmp_path, h
     n1.step()
     assert len(hub.state.queues.get(n2.fp, [])) == 2  # both waiting files landed once room returned
     assert n1._rcpt_backoff.get(rk) is None  # a landed send clears the verdict
+
+
+def test_a_pruned_recipient_costs_one_directory_recheck_per_pass_not_one_per_file(tmp_path, hub, principal, monkeypatch):
+    """_peer_card re-checks a cached-directory miss against the hub with a
+    fresh fetch; a backlog of files to a pruned recipient must share ONE
+    such re-check per pass, not pay a round trip per file."""
+    from natively import node as nodemod, crypto
+    n1 = make_node(tmp_path, "n1", hub.url, principal, {"alpha": ["msg.send"]})
+    ghost = "ed25519:" + crypto.b64e(crypto.sign_pub(crypto.gen_signing_key()))
+    for i in range(5):
+        n1.queue_send("alpha", ghost, {"kind": "text", "text": "g%d" % i})
+    calls = {"dir": 0}
+    real = nodemod._http
+
+    def counting(method, url, **kw):
+        if url.endswith("/v1/directory"):
+            calls["dir"] += 1
+        return real(method, url, **kw)
+    monkeypatch.setattr(nodemod, "_http", counting)
+    n1._flush_outbox()
+    assert calls["dir"] <= 2  # cached miss + the fresh re-check of the first file; the rest share the verdict
+    assert len([f for f in os.listdir(n1.outbox_dir) if f.endswith(".json")]) == 5  # all deferred, none lost

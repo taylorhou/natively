@@ -42,6 +42,27 @@ def home_dir() -> str:
     return os.environ.get("NATIVELY_HOME", os.path.expanduser("~/.natively"))
 
 
+def _fsize(p):
+    try:
+        return os.path.getsize(p)
+    except OSError:
+        return -1
+
+
+def _diag(home, kind, fields):
+    """Pass-timing rows, appended to diag.jsonl - deliberately NOT the
+    chained ledger.jsonl: the ledger is the durable record of grant
+    accounting and its rows are hash-chained, so telemetry has no place
+    in it."""
+    try:
+        row = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "kind": kind}
+        row.update(fields)
+        with open(os.path.join(home, "diag.jsonl"), "a") as fh:
+            fh.write(json.dumps(row, separators=(",", ":")) + "\n")
+    except OSError:
+        pass
+
+
 def _bare_key(k):
     """The bare base64 of an "ed25519:<b64>" agent key, or the string itself."""
     return k.split(":", 1)[1] if isinstance(k, str) and k.startswith("ed25519:") else k
@@ -202,6 +223,7 @@ class Node:
         # node's queue at the hub's cap) re-costs one POST per file per backoff expiry, and under a deep
         # backlog that churn, not RTT, becomes the drain limiter (air, 2026-09-09).
         self._file_to = {}     # outbox file -> its bare recipient, learnt when the file is first read
+        self._diag_save_ms = 0.0  # cumulative _save_state wall time, for pass timing
         self.spk_sk = bytes.fromhex(open(os.path.join(self.home, "spk.key")).read().strip())
         # Pinned root set: principal.pub (one key per line, the first is the
         # node's own principal) plus principals/<name>.pub, one file per
@@ -243,9 +265,11 @@ class Node:
         return {"last_seq": 0, "unacked": {}, "seen": []}
 
     def _save_state(self):
+        _t = time.monotonic()
         tmp = self.state_path + ".tmp"
         json.dump(self.state, open(tmp, "w"))
         os.replace(tmp, self.state_path)
+        self._diag_save_ms += (time.monotonic() - _t) * 1000.0
 
     def _load_agents(self):
         adir = os.path.join(self.home, "agents")
@@ -803,12 +827,18 @@ class Node:
             conn = self._hub_tls.conn = _HubConn(self.hub)
         return conn.request(method, path, body=body, headers=headers)
 
-    FLUSH_BATCH = 400  # outcomes per pass
+    FLUSH_BATCH = 800  # outcomes+dispatches per pass
     FLUSH_WORKERS = 4  # parallel POST lanes in the send phase; a lane carries
     # whole recipient shards serially, so per-recipient order (key before
     # relay, backoff) is exactly what the sequential pass gave globally
-    LIVE_WINDOW = 300  # newest files sent first...
-    DRAIN_SLICE = 100  # ...then a guaranteed slice of the oldest
+    LIVE_WINDOW = 600  # newest files sent first...
+    DRAIN_SLICE = 200  # ...then a guaranteed slice of the oldest
+    RECV_BATCH = 64    # inbound messages handled per step: the hub's poll
+    # can return the whole waiting queue, and receive-path work is
+    # ~0.5-0.7s per message - an inbound flood otherwise monopolizes the
+    # loop for minutes and the flush side starves (air, 2026-09-09:
+    # ms_poll 56-68s/step after the collect fix; 96 pinned at the hub's
+    # 500-cap under air's drain flood, same pathology)
 
     def _relay_waits_for_key(self, req, cache) -> bool:
         """A group_relay to a member still on the group's pending list would
@@ -828,7 +858,14 @@ class Node:
         return req.get("to") in cache[gid]
 
     def _flush_outbox(self):
+        _t0 = time.monotonic()
+        _save0 = self._diag_save_ms
         dead = {}  # recipient -> permanent identity verdict, this pass
+        unknown_rcpts = set()  # recipients already proven absent from the directory THIS PASS:
+        # _peer_card re-checks a cached-directory miss against the hub (fresh fetch), so without
+        # this set EVERY queued file to a pruned recipient costs one directory round trip per pass
+        # (air, 2026-09-09: 200 ghost files ~= 28s of collect per pass). A peer that registers
+        # mid-pass is picked up next pass; the deferral path is unchanged.
         pending_cache = {}  # group id -> the member keys whose key distribution is still pending, this pass
         dirty = False  # state changed; saved once at pass end, not per send
         outcomes = 0
@@ -843,6 +880,7 @@ class Node:
         # then a guaranteed oldest slice of 100 - live latency wins the
         # budget, the backlog drains at a steady floor.
         files = [f for f in sorted(os.listdir(self.outbox_dir)) if f.endswith(".json")]
+        n_files = len(files)
         # a file the hub asked to wait on (429, Retry-After) is not
         # attempted before its time and spends none of this pass's budget:
         # a backpressured recipient never starves every other delivery.
@@ -886,6 +924,8 @@ class Node:
         ctl = [f for f in files if f.startswith("ctl_")]
         rest = [f for f in files if not f.startswith("ctl_")]
         order = ctl[::-1] + rest[-self.LIVE_WINDOW:][::-1] + rest[:-self.LIVE_WINDOW][:self.DRAIN_SLICE]
+        n_eligible = len(files)
+        _t1 = time.monotonic()
         # Collection phase (main thread): every per-file decision through
         # envelope build runs here single-threaded, exactly as the
         # sequential pass did. POST-ready files are sharded by bare
@@ -912,6 +952,8 @@ class Node:
                     continue  # its key distribution is waiting on the hub: this file waits behind it (no attempt spent)
                 if self._rcpt_backoff.get(_bare_key(req.get("to")), (0.0,))[0] > now:
                     continue  # first read of a file to a refused recipient: it spends no budget either
+                if req["to"] in unknown_rcpts:
+                    raise IdentityUnknown("recipient absent from the directory (this pass)")
                 if req["to"] in dead:
                     # a recipient already found permanently undeliverable in
                     # this pass (e.g. card principal not in the pinned root
@@ -935,6 +977,7 @@ class Node:
                 try:
                     _, peer_fp = self._peer_card(req["to"])
                 except IdentityUnknown:
+                    unknown_rcpts.add(req["to"])
                     raise
                 except IdentityError as e:
                     dead[req["to"]] = str(e)
@@ -1023,6 +1066,8 @@ class Node:
                                        _oclass(e), "send failed: %s" % e)
                     os.rename(path, path + ".err")
                     outcomes += 1
+        _t2 = time.monotonic()
+        _t3 = _t4 = _t2
         if shards:
             # Send phase: lanes POST their shards concurrently. A lane
             # reports (item, exception-or-None, deferred) per file, in shard
@@ -1048,6 +1093,7 @@ class Node:
                     t.start()
                 for t in lanes:
                     t.join()
+            _t3 = time.monotonic()
             for shard_results in results:
                 if not shard_results:
                     continue
@@ -1061,8 +1107,21 @@ class Node:
                         o, d = 0, False  # a bookkeeping error leaves the file on disk: the next pass tries again
                     outcomes += o
                     dirty = dirty or d
+            _t4 = time.monotonic()
         if dirty:
             self._save_state()
+        _diag(self.home, "flush",
+              {"files": n_files, "eligible": n_eligible, "order": len(order),
+               "dispatched": dispatched, "outcomes": outcomes,
+               "unacked": len(self.state["unacked"]),
+               "deferred": len(self.state.get("deferred_since", {})),
+               "state_bytes": _fsize(self.state_path),
+               "ledger_bytes": _fsize(os.path.join(self.home, "ledger.jsonl")),
+               "ms_setup": round((_t1 - _t0) * 1000),
+               "ms_collect": round((_t2 - _t1) * 1000),
+               "ms_send": round((_t3 - _t2) * 1000),
+               "ms_apply": round((_t4 - _t3) * 1000),
+               "ms_save": round(self._diag_save_ms - _save0)})
 
     def _defer_429(self, f, req, e):
         """The hub has no room for this recipient: wait what it says
@@ -1901,18 +1960,27 @@ class Node:
 
     def step(self):
         """One pass: reload agents, flush the outbox, poll once, retry."""
+        _s0 = time.monotonic()
+        n_polled = -1
         self._load_agents()  # hot-reload: agent-add must not need a daemon restart
         self._maybe_reregister()
         if not self._last_reg_time:
             return  # never registered with this hub yet: peers would refuse us, and the poll would 401
         self._retry_pending_group_keys()
         self._flush_outbox()
+        _s1 = time.monotonic()
         try:
             after = self.state["last_seq"]
-            _, b = self._hub_req("GET", "/v1/poll/%s?after=%d" % (self.fp, after),
+            _, b = self._hub_req("GET", "/v1/poll/%s?after=%d&limit=%d" % (self.fp, after, self.RECV_BATCH),
                                  headers={"X-Natively-Auth": self._auth_token("poll", after=after)})
             d = json.loads(b)
-            for item in d.get("messages", []):
+            _s1a = time.monotonic()
+            batch = d.get("messages", [])
+            n_polled = len(batch)
+            # Handle at most RECV_BATCH per step; the hub prunes only at the
+            # cursor, so the unhandled tail (seq > last_seq after the slice)
+            # stays queued and comes back on the next poll.
+            for item in batch[:self.RECV_BATCH]:
                 if not isinstance(item, dict):
                     self.ledger.append("node:%s" % self.name, None, "msg.recv", {}, "rejected-malformed",
                                        "poll row is not an object")
@@ -1949,7 +2017,15 @@ class Node:
             self._save_state()
         except (urllib.error.URLError, OSError) as e:
             pass
+        _s2 = time.monotonic()
         self._retries()
+        _diag(self.home, "step",
+              {"ms_flush": round((_s1 - _s0) * 1000),
+               "ms_poll": round((_s2 - _s1) * 1000),
+               "ms_poll_fetch": round((_s1a - _s1) * 1000) if n_polled >= 0 else -1,
+               "ms_poll_handle": round((_s2 - _s1a) * 1000) if n_polled >= 0 else -1,
+               "ms_retry": round((time.monotonic() - _s2) * 1000),
+               "polled": n_polled, "handled": min(n_polled, self.RECV_BATCH) if n_polled >= 0 else -1})
 
 
 def init_node(home, name, hub_url, principal_pub_b64):
