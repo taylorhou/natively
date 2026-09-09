@@ -289,6 +289,11 @@ class Node:
         self.fp = jcs.sha256(self.node_pub)[:32]
         self._hub_tls = threading.local()  # per-thread lazy _HubConn for hot paths (flush, poll, retry)
         self._backoff = {}     # outbox file -> (not before, delay): a send the hub asked to wait on (429)
+        self._rcpt_backoff = {}  # bare recipient -> (not before, delay): the hub said THIS RECIPIENT's queue has
+        # no room (429) - every file to it waits, not only the one refused. Without it a capped recipient
+        # (a dead node's queue at QUEUE_MAX_MSGS) re-costs one POST per file per backoff expiry, and under a
+        # deep backlog that re-attempt churn, not RTT, becomes the drain limiter (air, 2026-09-09: lanes at
+        # -42/min net against ~130/min production while ~1/3 of the outbox targeted capped ghost queues).
         self._file_to = {}     # outbox file -> its recipient, learnt when the file is first read
         self.spk_sk = bytes.fromhex(open(os.path.join(self.home, "spk.key")).read().strip())
         # Pinned root set: principal.pub (one key per line, the first is the
@@ -1236,7 +1241,8 @@ class Node:
         # held stays out of the windows and the attempt count altogether;
         # one not read yet is found held when it is read, and known after
         files = [f for f in files if self._backoff.get(f, (0.0, 0.0))[0] <= now
-                 and not (not f.startswith("ctl_") and self._file_to.get(f) in held_to)]
+                 and not (not f.startswith("ctl_") and self._file_to.get(f) in held_to)
+                 and self._rcpt_backoff.get(self._file_to.get(f), (0.0,))[0] <= now]  # a recipient the hub refused room for spends none of this pass's budget either
         # Causal priority: a group_key distribution installs the receive
         # state later group_relay messages decrypt under. Newest-first alone
         # delivers a relay BEFORE its key when both were queued together
@@ -1281,6 +1287,8 @@ class Node:
                     continue  # its key distribution has not been queued yet: the file stays for a later pass
                 if not f.startswith("ctl_") and _bare_key(req.get("to")) in held_to:
                     continue  # its recipient's control envelope is waiting on the hub: this file waits behind it (no attempt spent)
+                if self._rcpt_backoff.get(_bare_key(req.get("to")), (0.0,))[0] > now:
+                    continue  # first read of a file to a refused recipient: it spends no attempt either
                 attempts += 1
                 if req["to"] in dead and not self._grouped(req):
                     # a recipient already found permanently undeliverable in
@@ -1530,6 +1538,7 @@ class Node:
                                "msg.send", {"to": req["to"], "msg_id": env["msg_id"]}, "queued",
                                "sent %s to %s" % (req["body_obj"].get("kind", "msg"), req["to"]))
             os.unlink(path)
+            self._rcpt_backoff.pop(_bare_key(req.get("to")), None)  # a send landed: the recipient's queue had room after all
             if self.state.get("deferred_since", {}).pop(f, None) is not None:
                 dirty = True
             outcomes += 1
@@ -1570,6 +1579,12 @@ class Node:
                 prev = self._backoff.get(f, (0.0, 0.0))[1]
                 delay = min(60.0, max(asked, prev * 2, float(P)))
                 self._backoff[f] = (time.time() + delay, delay)
+                rk = _bare_key(req.get("to"))
+                rprev = self._rcpt_backoff.get(rk, (0.0, 0.0))[1]
+                # the refusal is a property of the recipient's hub queue, not
+                # of this file: every file to it waits out the same delay
+                self._rcpt_backoff[rk] = (time.time() + min(60.0, max(asked, rprev * 2, float(P))),
+                                          min(60.0, max(asked, rprev * 2, float(P))))
                 if isinstance(env, dict) and req.get("env") is not env:
                     req["env"] = env  # the envelope this pass built goes again as it is, next pass
                     _w600_replace(path, json.dumps(req).encode())
