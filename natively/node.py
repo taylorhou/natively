@@ -1516,9 +1516,10 @@ class Node:
         _s1 = time.monotonic()
         try:
             after = self.state["last_seq"]
-            _, b = self._hub_req("GET", "/v1/poll/%s?after=%d" % (self.fp, after),
+            _, b = self._hub_req("GET", "/v1/poll/%s?after=%d&limit=%d" % (self.fp, after, self.RECV_BATCH),
                                  headers={"X-Natively-Auth": self._auth_token("poll", after=after)})
             d = json.loads(b)
+            _s1a = time.monotonic()
             batch = d.get("messages", [])
             n_polled = len(batch)
             # Handle at most RECV_BATCH per step; the hub prunes only at the
@@ -1573,6 +1574,8 @@ class Node:
         _diag(self.home, "step",
               {"ms_flush": round((_s1 - _s0) * 1000),
                "ms_poll": round((_s2 - _s1) * 1000),
+               "ms_poll_fetch": round((_s1a - _s1) * 1000) if n_polled >= 0 else -1,
+               "ms_poll_handle": round((_s2 - _s1a) * 1000) if n_polled >= 0 else -1,
                "ms_retry": round((time.monotonic() - _s2) * 1000),
                "polled": n_polled, "handled": min(n_polled, self.RECV_BATCH) if n_polled >= 0 else -1})
 
