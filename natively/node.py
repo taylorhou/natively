@@ -42,6 +42,11 @@ def home_dir() -> str:
     return os.environ.get("NATIVELY_HOME", os.path.expanduser("~/.natively"))
 
 
+def _bare_key(k):
+    """The bare base64 of an "ed25519:<b64>" agent key, or the string itself."""
+    return k.split(":", 1)[1] if isinstance(k, str) and k.startswith("ed25519:") else k
+
+
 def _w600(path, data: bytes):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -190,7 +195,13 @@ class Node:
         self.node_pub = crypto.sign_pub(self.node_seed)
         self.node_key = "ed25519:" + crypto.b64e(self.node_pub)
         self.fp = jcs.sha256(self.node_pub)[:32]
-        self._hub_conn = None  # lazy _HubConn for hot paths (flush, poll, retry)
+        self._hub_tls = threading.local()  # per-thread lazy _HubConn for hot paths (flush, poll, retry)
+        self._backoff = {}     # outbox file -> (not before, delay): a send the hub asked to wait on (429)
+        self._rcpt_backoff = {}  # bare recipient -> (not before, delay): the hub said THIS RECIPIENT's queue has
+        # no room - every file to it waits, not only the one refused. Without it a capped recipient (a dead
+        # node's queue at the hub's cap) re-costs one POST per file per backoff expiry, and under a deep
+        # backlog that churn, not RTT, becomes the drain limiter (air, 2026-09-09).
+        self._file_to = {}     # outbox file -> its bare recipient, learnt when the file is first read
         self.spk_sk = bytes.fromhex(open(os.path.join(self.home, "spk.key")).read().strip())
         # Pinned root set: principal.pub (one key per line, the first is the
         # node's own principal) plus principals/<name>.pub, one file per
@@ -787,11 +798,15 @@ class Node:
         """Hub call over a persistent keep-alive connection (hot paths only:
         flush sends, poll, retries). One TCP+TLS setup per node run instead
         of one per message. Cold paths stay on _http/urllib."""
-        if self._hub_conn is None:
-            self._hub_conn = _HubConn(self.hub)
-        return self._hub_conn.request(method, path, body=body, headers=headers)
+        conn = getattr(self._hub_tls, "conn", None)
+        if conn is None:
+            conn = self._hub_tls.conn = _HubConn(self.hub)
+        return conn.request(method, path, body=body, headers=headers)
 
     FLUSH_BATCH = 400  # outcomes per pass
+    FLUSH_WORKERS = 4  # parallel POST lanes in the send phase; a lane carries
+    # whole recipient shards serially, so per-recipient order (key before
+    # relay, backoff) is exactly what the sequential pass gave globally
     LIVE_WINDOW = 300  # newest files sent first...
     DRAIN_SLICE = 100  # ...then a guaranteed slice of the oldest
 
@@ -828,6 +843,39 @@ class Node:
         # then a guaranteed oldest slice of 100 - live latency wins the
         # budget, the backlog drains at a steady floor.
         files = [f for f in sorted(os.listdir(self.outbox_dir)) if f.endswith(".json")]
+        # a file the hub asked to wait on (429, Retry-After) is not
+        # attempted before its time and spends none of this pass's budget:
+        # a backpressured recipient never starves every other delivery.
+        # Eligibility is decided BEFORE the windows below are cut, so a
+        # deferred backlog never hides an eligible file in the middle - and
+        # a wedge of undrainable files can never stall the oldest slice
+        # (air, 2026-09-09: the oldest 100 were all undrainable, so live
+        # traffic behind them starved). And a recipient whose control
+        # envelope (a group key) is waiting holds its later relays too: a
+        # relay must never overtake the key it decrypts under, backpressure
+        # included.
+        now = time.time()
+        present = set(files)
+        self._backoff = {f: v for f, v in self._backoff.items() if f in present}
+        self._file_to = {f: v for f, v in self._file_to.items() if f in present}
+        held_to = set()
+        for f in files:
+            if f.startswith("ctl_") and self._backoff.get(f, (0.0, 0.0))[0] > now:
+                k = self._file_to.get(f)
+                if k is None:
+                    try:
+                        k = _bare_key(json.load(open(os.path.join(self.outbox_dir, f))).get("to"))
+                        self._file_to[f] = k
+                    except (OSError, ValueError):
+                        pass
+                if k:
+                    held_to.add(k)
+        # a file whose recipient is known (read on an earlier pass) to be
+        # held stays out of the windows and the attempt count altogether;
+        # one not read yet is found held when it is read, and known after
+        files = [f for f in files if self._backoff.get(f, (0.0, 0.0))[0] <= now
+                 and self._rcpt_backoff.get(self._file_to.get(f), (0.0,))[0] <= now
+                 and not (not f.startswith("ctl_") and self._file_to.get(f) in held_to)]
         # Causal priority: a group_key distribution installs the receive
         # state later group_relay messages decrypt under. Newest-first alone
         # delivers a relay BEFORE its key when both were queued together
@@ -838,16 +886,32 @@ class Node:
         ctl = [f for f in files if f.startswith("ctl_")]
         rest = [f for f in files if not f.startswith("ctl_")]
         order = ctl[::-1] + rest[-self.LIVE_WINDOW:][::-1] + rest[:-self.LIVE_WINDOW][:self.DRAIN_SLICE]
+        # Collection phase (main thread): every per-file decision through
+        # envelope build runs here single-threaded, exactly as the
+        # sequential pass did. POST-ready files are sharded by bare
+        # recipient: all of one recipient's files POST serially, in order,
+        # on one lane, so a key distribution is never overtaken by a relay
+        # that decrypts under it. Only the hub POST runs on the lanes: it is
+        # the latency-bound part (~1 RTT per send with keep-alive), and
+        # parallel lanes multiply it without any lane touching state.
+        shards = {}
+        shard_seq = []
+        dispatched = 0
         for i, f in enumerate(order):
-            if outcomes >= FLUSH_BATCH or i >= FLUSH_BATCH:
+            if outcomes + dispatched >= FLUSH_BATCH or i >= FLUSH_BATCH:
                 break  # attempts are bounded too: an outage must not spend one timeout per queued file before the poll
             if i and i % 200 == 0:
                 self._maybe_reregister()
             path = os.path.join(self.outbox_dir, f)
             try:
                 req = json.load(open(path))
+                self._file_to[f] = _bare_key(req.get("to"))
                 if self._relay_waits_for_key(req, pending_cache):
                     continue  # its key distribution has not been queued yet: the file stays for a later pass
+                if not f.startswith("ctl_") and _bare_key(req.get("to")) in held_to:
+                    continue  # its key distribution is waiting on the hub: this file waits behind it (no attempt spent)
+                if self._rcpt_backoff.get(_bare_key(req.get("to")), (0.0,))[0] > now:
+                    continue  # first read of a file to a refused recipient: it spends no budget either
                 if req["to"] in dead:
                     # a recipient already found permanently undeliverable in
                     # this pass (e.g. card principal not in the pinned root
@@ -910,41 +974,22 @@ class Node:
                     a["card"]["agent_key"].split(":", 1)[1], req["to"].split(":", 1)[-1],
                     ct_b64, a["seed"], grant_ids=req["grant_ids"], in_reply_to=req.get("in_reply_to"),
                     msg_type=req["msg_type"], extra=extra)
-                try:
-                    self._hub_req("POST", "/v1/msg", json.dumps(env).encode())
-                except urllib.error.HTTPError as e:
-                    if e.code == 409:
-                        self._dir_cache = (0.0, None)
-                        raise RecipientMoved("recipient moved to another node; re-encrypting next pass")
-                    if e.code == 404:
-                        # the hub does not know the recipient right now (a
-                        # re-registration gap, or not registered yet): wait,
-                        # exactly as when the directory has no card for it
-                        self._dir_cache = (0.0, None)
-                        raise IdentityUnknown("recipient unknown to the hub")
-                    raise
-                # Acks never enter the retry table: an ack is an answer, not
-                # a message - nobody acks an ack, so every ack entered here
-                # retries 3x and dead-letters as a false UNDELIVERED (the
-                # 2026-09-08 exchange failure class, mirrored on both
-                # implementations).
-                if env.get("type") != "ack":
-                    self.state["unacked"][env["msg_id"]] = {
-                        "env": env, "attempts": 1, "next": time.time() + 2 * P,
-                        "peer_fp": peer_fp}
-                dirty = True  # saved once at pass end; a crash costs at most a duplicate send, and apply is idempotent on msg_id
-                gids = [g for g in (req.get("grant_ids") or []) if envelope.safe_id(g, "grt")]  # the row names a grant id or none
-                self.ledger.append("agent:%s" % req["from_agent"], gids[0] if gids else None,
-                                   "msg.send", {"to": req["to"], "msg_id": env["msg_id"]}, "queued",
-                                   "sent %s to %s" % (req["body_obj"].get("kind", "msg"), req["to"]))
-                os.unlink(path)
-                if self.state.get("deferred_since", {}).pop(f, None) is not None:
-                    dirty = True
-                outcomes += 1
+                # POST-ready: queue on the recipient's shard lane. The lane
+                # POSTs; _flush_apply records the outcome afterwards, on the
+                # main thread, in per-recipient order.
+                k = _bare_key(req["to"])
+                if k not in shards:
+                    shards[k] = []
+                    shard_seq.append(k)
+                shards[k].append((f, path, req, env, peer_fp))
+                dispatched += 1
             except Exception as e:
                 transient = isinstance(e, (urllib.error.URLError, TimeoutError, OSError, IdentityUnknown, RecipientMoved))
-                if isinstance(e, urllib.error.HTTPError) and 400 <= e.code < 500:
-                    transient = False  # 4xx is a permanent rejection, not a retry case
+                if isinstance(e, urllib.error.HTTPError) and 400 <= e.code < 500 and e.code != 429:
+                    transient = False  # 4xx is a permanent rejection, not a retry case - except 429, the hub asking for room
+                if isinstance(e, urllib.error.HTTPError) and e.code == 429:
+                    self._defer_429(f, req, e)
+                    continue
                 if transient and isinstance(e, IdentityUnknown):
                     # Recipient not in the directory: retryable while it
                     # may still register, terminal after DEFER_UNKNOWN_TTL
@@ -978,8 +1023,168 @@ class Node:
                                        _oclass(e), "send failed: %s" % e)
                     os.rename(path, path + ".err")
                     outcomes += 1
+        if shards:
+            # Send phase: lanes POST their shards concurrently. A lane
+            # reports (item, exception-or-None, deferred) per file, in shard
+            # order; the main thread applies every outcome below, so all
+            # ledger/state/backoff writes stay single-threaded and in
+            # per-recipient order. A lane that dies strands its remaining
+            # shards this pass: unposted files sit untouched on disk.
+            seq = [shards[k] for k in shard_seq]
+            nlanes = min(self.FLUSH_WORKERS, len(seq))
+            results = [None] * len(seq)
+            if nlanes <= 1:
+                results[0] = self._flush_post_shard(seq[0])
+            else:
+                def _lane(wi):
+                    for si in range(wi, len(seq), nlanes):
+                        try:
+                            results[si] = self._flush_post_shard(seq[si])
+                        except Exception:
+                            pass
+                lanes = [threading.Thread(target=_lane, args=(wi,), daemon=True, name="flush-%d" % wi)
+                         for wi in range(nlanes)]
+                for t in lanes:
+                    t.start()
+                for t in lanes:
+                    t.join()
+            for shard_results in results:
+                if not shard_results:
+                    continue
+                for item, exc, deferred in shard_results:
+                    if deferred:
+                        continue  # waits behind its key distribution, exactly as the held set held it
+                    f, path, req, env, peer_fp = item
+                    try:
+                        o, d = self._flush_apply(f, path, req, env, peer_fp, exc)
+                    except Exception:
+                        o, d = 0, False  # a bookkeeping error leaves the file on disk: the next pass tries again
+                    outcomes += o
+                    dirty = dirty or d
         if dirty:
             self._save_state()
+
+    def _defer_429(self, f, req, e):
+        """The hub has no room for this recipient: wait what it says
+        (Retry-After), doubling on every further refusal up to a minute.
+        The refusal is a property of the recipient's hub queue, not of this
+        file: every file to the recipient waits out the same verdict, so a
+        capped recipient costs one probe per backoff, not one POST per file."""
+        try:
+            asked = float((e.headers or {}).get("Retry-After", 0) or 0)
+        except (TypeError, ValueError):
+            asked = 0.0
+        prev = self._backoff.get(f, (0.0, 0.0))[1]
+        delay = min(60.0, max(asked, prev * 2, float(P)))
+        self._backoff[f] = (time.time() + delay, delay)
+        rk = _bare_key(req.get("to"))
+        rprev = self._rcpt_backoff.get(rk, (0.0, 0.0))[1]
+        rdelay = min(60.0, max(asked, rprev * 2, float(P)))
+        self._rcpt_backoff[rk] = (time.time() + rdelay, rdelay)
+        self.ledger.append("node:%s" % self.name, None, "msg.send", {"file": f},
+                           "retry", "send deferred %.0fs: %s" % (delay, e))
+
+    def _flush_post_shard(self, items):
+        """POST one recipient's files serially over the lane's own keep-alive
+        connection (_hub_req is per-thread). Only the network call happens
+        on the lane; every state mutation is applied afterwards by the main
+        thread in _flush_apply, in this same order. A control envelope the
+        hub refused room for (429) defers the rest of the shard: its relays
+        must never overtake the key they decrypt under."""
+        out = []
+        deferred = False
+        for item in items:
+            f, path, req, env, peer_fp = item
+            if deferred:
+                out.append((item, None, True))
+                continue
+            try:
+                self._hub_req("POST", "/v1/msg", json.dumps(env).encode())
+                out.append((item, None, False))
+            except urllib.error.HTTPError as e:
+                out.append((item, e, False))
+                if e.code == 429 and f.startswith("ctl_"):
+                    deferred = True
+            except Exception as e:
+                out.append((item, e, False))
+        return out
+
+    def _flush_apply(self, f, path, req, env, peer_fp, exc):
+        """Main-thread bookkeeping for one posted send: exactly what the
+        sequential pass did inline after its POST returned. Lanes POST and
+        report; all state changes happen here. Returns (outcomes, dirty)
+        for the pass counters."""
+        outcomes = 0
+        dirty = False
+        if exc is None:
+            # Acks never enter the retry table: an ack is an answer, not
+            # a message - nobody acks an ack, so every ack entered here
+            # retries 3x and dead-letters as a false UNDELIVERED (the
+            # 2026-09-08 exchange failure class, mirrored on both
+            # implementations).
+            if env.get("type") != "ack":
+                self.state["unacked"][env["msg_id"]] = {
+                    "env": env, "attempts": 1, "next": time.time() + 2 * P,
+                    "peer_fp": peer_fp}
+            dirty = True  # saved once at pass end; a crash costs at most a duplicate send, and apply is idempotent on msg_id
+            gids = [g for g in (req.get("grant_ids") or []) if envelope.safe_id(g, "grt")]  # the row names a grant id or none
+            self.ledger.append("agent:%s" % req["from_agent"], gids[0] if gids else None,
+                               "msg.send", {"to": req["to"], "msg_id": env["msg_id"]}, "queued",
+                               "sent %s to %s" % (req["body_obj"].get("kind", "msg"), req["to"]))
+            os.unlink(path)
+            self._rcpt_backoff.pop(_bare_key(req.get("to")), None)  # a send landed: the recipient's queue had room after all
+            if self.state.get("deferred_since", {}).pop(f, None) is not None:
+                dirty = True
+            outcomes += 1
+            return outcomes, dirty
+        e = exc
+        try:
+            if isinstance(e, urllib.error.HTTPError) and e.code == 409:
+                self._dir_cache = (0.0, None)
+                raise RecipientMoved("recipient moved to another node; re-encrypting next pass")
+            if isinstance(e, urllib.error.HTTPError) and e.code == 404:
+                # the hub does not know the recipient right now (a
+                # re-registration gap, or not registered yet): wait,
+                # exactly as when the directory has no card for it
+                self._dir_cache = (0.0, None)
+                raise IdentityUnknown("recipient unknown to the hub")
+            raise e
+        except Exception as e:
+            transient = isinstance(e, (urllib.error.URLError, TimeoutError, OSError, IdentityUnknown, RecipientMoved))
+            if isinstance(e, urllib.error.HTTPError) and 400 <= e.code < 500 and e.code != 429:
+                transient = False  # 4xx is a permanent rejection, not a retry case - except 429, the hub asking for room
+            if isinstance(e, urllib.error.HTTPError) and e.code == 429:
+                self._defer_429(f, req, e)
+                return outcomes, dirty
+            if transient and isinstance(e, IdentityUnknown):
+                ds = self.state.setdefault("deferred_since", {})
+                first = ds.get(f)
+                if first is None:
+                    ds[f] = time.time()
+                    dirty = True
+                    self.ledger.append("node:%s" % self.name, None, "msg.send", {"file": f},
+                                       "retry", "send deferred: %s" % e)
+                elif time.time() - first > DEFER_UNKNOWN_TTL:
+                    ds.pop(f, None)
+                    dirty = True
+                    self.ledger.append("agent:%s" % req["from_agent"], None, "msg.send",
+                                       {"file": f, "to": req.get("to")}, "recipient-unknown",
+                                       "terminal: recipient not in the directory for >%ds" % DEFER_UNKNOWN_TTL)
+                    os.rename(path, path + ".err")
+                    outcomes += 1
+                else:
+                    self.ledger.append("node:%s" % self.name, None, "msg.send", {"file": f},
+                                       "retry", "send deferred: %s" % e)
+            elif transient:
+                # hub down / network blip: leave in outbox, retry next pass
+                self.ledger.append("node:%s" % self.name, None, "msg.send", {"file": f},
+                                   "retry", "send deferred: %s" % e)
+            else:
+                self.ledger.append("node:%s" % self.name, None, "msg.send", {"file": f},
+                                   _oclass(e), "send failed: %s" % e)
+                os.rename(path, path + ".err")
+                outcomes += 1
+        return outcomes, dirty
 
     # ---------- receive path ----------
     def _handle_envelope(self, env):
