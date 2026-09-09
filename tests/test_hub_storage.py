@@ -40,6 +40,7 @@ def test_byte_quotas_refuse_before_accepting_and_a_sender_keeps_the_envelope(tmp
     assert "retry" in outcomes(n1, "msg.send") and len([f for f in os.listdir(n1.outbox_dir) if f.endswith(".json")]) == 1
     hub.state.QUEUE_MAX_BYTES = 16 * 1024 * 1024
     n1._backoff.clear()  # the Retry-After wait is over
+    n1._rcpt_backoff.clear()  # and the per-recipient verdict the refusal set
     pump([n1, n2], 6)
     assert [r["body"]["text"] for r in inbox(n2, "beta")] == ["waiting for room"]
     # the hub-wide quota too
@@ -76,6 +77,7 @@ def test_fan_out_is_charged_for_every_copy_and_a_deferred_send_spends_no_budget(
     assert [r["body"]["text"] for r in inbox(n3, "gamma")] == ["gamma goes on"]
     assert f in os.listdir(n1.outbox_dir)  # the deferred file was not attempted before its time
     n1._backoff[f] = (0.0, n1._backoff[f][1])
+    n1._rcpt_backoff.clear()  # the per-recipient verdict the refusal set expires with the wait
     pump([n1, n2], 3)
     assert [r["body"]["text"] for r in inbox(n2, "beta")] == ["no room at beta"]
 
@@ -94,6 +96,7 @@ def test_a_relay_waits_behind_its_recipients_deferred_control_envelope(tmp_path,
     n1.step()
     assert not hub.state.queues.get(n2.fp)  # the relay did not overtake the key
     n1._backoff[ctl] = (0.0, n1._backoff[ctl][1])
+    n1._rcpt_backoff.clear()  # the per-recipient verdict the refusal set expires with the wait
     n1.step()
     kinds = [m["env"] for m in hub.state.queues[n2.fp]]
     assert len(kinds) == 2 and kinds[0].get("class") == "control"  # the key first, then the relay
@@ -341,6 +344,7 @@ def test_a_refused_send_goes_again_as_the_envelope_it_built(tmp_path, hub, princ
     mid = req["env"]["msg_id"]
     pump([n2], 2)  # beta's node polls: room again
     n1._backoff = {}  # the wait the hub asked for is over
+    n1._rcpt_backoff.clear()  # and the per-recipient verdict the refusal set
     n1.step()
     assert [m["env"]["msg_id"] for m in hub.state.queues.get(n2.fp, [])] == [mid]  # the same envelope, not a re-encryption
     pump([n2], 2)
