@@ -1,0 +1,5 @@
+#!/bin/sh
+# natively CLI wrapper: runs the package in its own venv from any working directory.
+# PYTHONPATH (not cd) so relative paths the caller passes (--out FILE) stay theirs.
+HERE="$(cd "$(dirname "$0")/.." && pwd)"
+PYTHONPATH="$HERE${PYTHONPATH:+:$PYTHONPATH}" exec "$HERE/.venv/bin/python" -m natively "$@"

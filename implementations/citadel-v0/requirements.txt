@@ -1,0 +1,12 @@
+cffi==2.1.1
+cryptography==50.0.1
+iniconfig==2.3.0
+packaging==26.3
+pluggy==1.6.0
+pycparser==3.0
+pygments==2.21.0
+pytest==9.1.1
+python-ulid==4.0.1
+regex==2026.9.3
+ruff==0.16.6
+typing-extensions==4.16.0
