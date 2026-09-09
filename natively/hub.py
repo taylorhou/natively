@@ -338,9 +338,21 @@ def make_server(port: int, state: State):
                 if not envelope.safe_fp(fp):
                     return self._json(400, {"error": "bad node fingerprint"})
                 after = 0
+                limit = 0
                 for kv in q.split("&"):
                     if kv.startswith("after="):
                         after = int(kv[6:])
+                    elif kv.startswith("limit="):
+                        # a node with receive-side batching asks for a page:
+                        # without a cap the poll returns the WHOLE waiting
+                        # queue every call (air, 2026-09-09: 500 envelopes
+                        # re-downloaded per ~100s step while only 64 were
+                        # handled each time). Unknown to older hubs, which
+                        # ignore the parameter and stay uncapped.
+                        try:
+                            limit = max(0, int(kv[6:]))
+                        except ValueError:
+                            limit = 0
                 # a poll reads and prunes this node's queue: only the node
                 # whose registered key signed the token may do that
                 err = self._check_poll_token(fp, after)
@@ -360,7 +372,7 @@ def make_server(port: int, state: State):
                         q_list = st.queues.get(fp, [])
                         new = [e for e in q_list if e.get("_seq", 0) > after]
                         if new or time.time() > deadline:
-                            out = new
+                            out = new[:limit] if limit else new
                             last = q_list[-1]["_seq"] if q_list else after
                             break
                         st._cond(fp).wait(timeout=st.POLL_WAIT)
