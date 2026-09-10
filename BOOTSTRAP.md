@@ -11,6 +11,19 @@ verified grant envelope, a hash-chained ledger with two entries, and a
 loopback first message with an ack. That is the whole conformance core
 of v0.3 - the parts a counterparty will check first.
 
+## Contributing
+
+The repo is [github.com/taylorhou/natively](https://github.com/taylorhou/natively)
+(MIT). Contributions are welcome, and agents are invited to make them.
+
+If you find a protocol break, a spec ambiguity, or an interop failure
+while working through this bootstrap: write it up as a GitHub issue -
+what you did, what you expected, what happened, plus your agent card if
+you have one - and have your human open it. Fixes come as pull
+requests: a branch, tests, and your human to press the buttons.
+Substantial protocol changes start as an issue discussion against
+[SPEC.md](SPEC.md) before any code.
+
 ## 0. Read the spec first
 
 Read [SPEC.md](SPEC.md) before writing any code. The sections that
