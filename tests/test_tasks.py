@@ -27,14 +27,16 @@ def test_idempotent_completion_and_owner_enforcement(tmp_path):
     store.post("board", "producer", "tsk_1", "work", "blob:x")
     claimed = store.transition("tsk_1", 1, "task.claim", "worker", "claim", lease_id="lease", lease_seconds=60)
     try:
-        store.transition("tsk_1", 2, "task.complete", "other", "bad", lease_id="lease", result_ref="blob:r")
+        store.transition("tsk_1", 2, "task.submit", "other", "bad", lease_id="lease", result_ref="blob:r")
         assert False
     except TaskConflict:
         pass
-    done = store.transition("tsk_1", claimed["revision"], "task.complete", "worker", "done", lease_id="lease", result_ref="blob:r")
-    replay = store.transition("tsk_1", claimed["revision"], "task.complete", "worker", "done", lease_id="lease", result_ref="blob:r")
-    assert done == replay and done["state"] == "completed"
-    assert len(store.events("board")) == 3
+    submitted = store.transition("tsk_1", claimed["revision"], "task.submit", "worker", "done", lease_id="lease", result_ref="blob:r")
+    replay = store.transition("tsk_1", claimed["revision"], "task.submit", "worker", "done", lease_id="lease", result_ref="blob:r")
+    assert submitted == replay and submitted["state"] == "submitted"
+    done = store.transition("tsk_1", submitted["revision"], "task.accept", "producer", "accept")
+    assert done["state"] == "completed"
+    assert len(store.events("board")) == 4
 
 
 def test_expired_claim_reopens_with_incremented_attempt(tmp_path):
@@ -59,7 +61,8 @@ def test_dependencies_capabilities_and_extensions(tmp_path):
         except TaskConflict:
             pass
     dep = store.transition("dep", 1, "task.claim", "w", "dc", lease_id="dl", lease_seconds=5)
-    store.transition("dep", dep["revision"], "task.complete", "w", "dd", lease_id="dl", result_ref="blob:r")
+    submitted = store.transition("dep", dep["revision"], "task.submit", "w", "dd", lease_id="dl", result_ref="blob:r")
+    store.transition("dep", submitted["revision"], "task.accept", "p", "da")
     job = store.transition("job", 1, "task.claim", "w", "jc", ["bill.extract.v1"], lease_id="jl", lease_seconds=5)
     assert job["extensions"]["teale.market.v1"] == {"bid_ref": None}
 
@@ -78,3 +81,18 @@ def test_repeated_claim_races_never_double_win(tmp_path):
                 return 0
         with concurrent.futures.ThreadPoolExecutor(max_workers=20) as pool:
             assert sum(pool.map(race, range(20))) == 1
+
+def test_only_named_verifier_accepts_and_rejection_requeues(tmp_path):
+    store = TaskStore(tmp_path / "tasks.db")
+    store.post("apmhelp.bill-entry", "poster", "bill", "bill", "blob:b",
+               verifier="apm-verifier", acceptance_ref="blob:criteria")
+    claimed = store.transition("bill", 1, "task.claim", "worker", "claim", lease_id="lease", lease_seconds=60)
+    submitted = store.transition("bill", claimed["revision"], "task.submit", "worker", "submit", lease_id="lease", result_ref="blob:result")
+    try:
+        store.transition("bill", submitted["revision"], "task.accept", "poster", "wrong-verifier")
+        assert False
+    except TaskConflict:
+        pass
+    ready = store.transition("bill", submitted["revision"], "task.reject", "apm-verifier", "reject", feedback_ref="blob:feedback")
+    assert ready["state"] == "ready" and ready["result_ref"] is None
+    assert ready["feedback_ref"] == "blob:feedback"

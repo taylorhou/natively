@@ -26,6 +26,8 @@ A task has an immutable `task_id` and revisioned state:
   "created_at": "2026-09-19T05:00:00Z",
   "title": "Extract bill fields",
   "body_ref": "blob:<encrypted-blob-id>",
+  "verifier": "ed25519:<agent-key>",
+  "acceptance_ref": "blob:<encrypted-criteria-id>",
   "required_capabilities": ["bill.extract.v1"],
   "depends_on": [],
   "priority": 50,
@@ -53,7 +55,8 @@ States:
 - `ready`: dependencies complete and no live claim
 - `claimed`: one live lease owns execution
 - `action`: owner paused for durable human/agent input; lease remains owned
-- `completed`: terminal success with a result reference
+- `submitted`: worker finished and released execution; verifier must judge the result
+- `completed`: verifier accepted the submitted result
 - `failed`: retryable or terminal according to the signed transition
 - `cancelled`: terminal principal cancellation
 
@@ -69,11 +72,25 @@ Task mutations use the existing signed message/envelope machinery with an action
 - `task.checkpoint` on `task:<task-id>`
 - `task.action_required` on `task:<task-id>`
 - `task.resume` on `task:<task-id>`
-- `task.complete` on `task:<task-id>`
+- `task.submit` on `task:<task-id>`
+- `task.accept` on `task:<task-id>`
+- `task.reject` on `task:<task-id>`
 - `task.fail` on `task:<task-id>`
 - `task.cancel` on `task:<task-id>`
 
 Every transition includes `task_id`, `expected_revision`, an idempotency key, timestamp, and action-specific fields. Existing grant rules apply: an informational message cannot mutate work. Board grants restrict who may post, claim, approve, cancel, or read encrypted refs. The hub verifies envelope signatures and grant shape before coordination, and each node independently verifies before acting.
+
+## Private boards and verification
+
+v0.1 begins with private tenant boards, not one global queue. Board membership, task metadata, encrypted refs, event cursors, and grants are isolated by `board_id`. Cross-board reads and claims fail closed even when the same principal belongs to both boards.
+
+The first boards and verifier paths are:
+
+- `apmhelp.bill-entry`: the verifier is APM's acceptance agent/service. `acceptance_ref` pins the labeled-field schema, accuracy/tolerance thresholds, model/prompt version, and no-invented-field rules from the Windows rollout runbook.
+- `ccc.campaign`: the posting agent is verifier. It accepts or rejects the returned campaign artifact against the task's signed criteria; outbound communication remains a separate grant/action.
+- `tto.audit`: the posting audit agent is verifier. It accepts only a cited, reproducible work product under TTO's human-signoff pipeline; a task completion never publishes a finding by itself.
+
+Workers use `task.submit`, not `task.complete`. Submission stores the encrypted result ref and removes the execution lease. Only the named verifier may `task.accept` (terminal `completed`) or `task.reject` (returns to `ready`, increments attempt on the next claim, and stores an encrypted rejection/feedback ref). This preserves payment semantics for the future work market: Teale escrow can settle on an accepted event without trusting a worker's self-declared completion. Natively records verifier identity and result, but Teale/gateway owns escrow and marketplace disputes.
 
 ## Atomic claim and no-duplicate rule
 

@@ -11,7 +11,7 @@ import time
 import uuid
 
 TERMINAL = {"completed", "cancelled"}
-VALID_STATES = {"ready", "claimed", "action", "completed", "failed", "cancelled"}
+VALID_STATES = {"ready", "claimed", "action", "submitted", "completed", "failed", "cancelled"}
 
 
 class TaskConflict(Exception):
@@ -84,12 +84,15 @@ class TaskStore:
             "SELECT document FROM tasks WHERE task_id=?", (task_id,)).fetchone())
 
     def post(self, board_id, actor, task_id, title, body_ref, capabilities=(),
-             depends_on=(), priority=50, extensions=None, idempotency_key=None):
+             depends_on=(), priority=50, extensions=None, idempotency_key=None,
+             verifier=None, acceptance_ref=None):
         now = self.clock()
         task = {
             "task_id": task_id, "board_id": board_id, "revision": 1,
             "created_by": actor, "created_at": now, "title": title,
-            "body_ref": body_ref, "required_capabilities": sorted(set(capabilities)),
+            "body_ref": body_ref, "verifier": verifier or actor,
+            "acceptance_ref": acceptance_ref,
+            "required_capabilities": sorted(set(capabilities)),
             "depends_on": list(depends_on), "priority": int(priority),
             "extensions": dict(extensions or {}), "state": "ready", "claim": None,
             "checkpoint_ref": None, "result_ref": None, "failure": None,
@@ -120,12 +123,13 @@ class TaskStore:
     def transition(self, task_id, expected_revision, action, actor, idempotency_key,
                    capabilities=(), lease_id=None, lease_seconds=None,
                    checkpoint_ref=None, result_ref=None, failure=None,
-                   extensions=None):
+                   extensions=None, feedback_ref=None):
         request = self._json({"task_id": task_id, "expected_revision": expected_revision,
             "action": action, "actor": actor, "capabilities": sorted(set(capabilities)),
             "lease_id": lease_id, "lease_seconds": lease_seconds,
             "checkpoint_ref": checkpoint_ref, "result_ref": result_ref,
-            "failure": failure, "extensions": extensions})
+            "failure": failure, "extensions": extensions,
+            "feedback_ref": feedback_ref})
         db = self._db()
         try:
             db.execute("BEGIN IMMEDIATE")
@@ -140,7 +144,8 @@ class TaskStore:
             if task["revision"] != expected_revision:
                 raise TaskConflict("revision mismatch", task)
             self._apply(db, task, action, actor, now, set(capabilities), lease_id,
-                        lease_seconds, checkpoint_ref, result_ref, failure, extensions)
+                        lease_seconds, checkpoint_ref, result_ref, failure, extensions,
+                        feedback_ref)
             task["revision"] += 1; task["updated_at"] = now
             response = self._json(task)
             changed = db.execute("UPDATE tasks SET revision=?,state=?,document=?,updated_at=? WHERE task_id=? AND revision=?",
@@ -155,7 +160,7 @@ class TaskStore:
 
 
     def _apply(self, db, task, action, actor, now, caps, lease_id, lease_seconds,
-               checkpoint_ref, result_ref, failure, extensions):
+               checkpoint_ref, result_ref, failure, extensions, feedback_ref):
         state, claim = task["state"], task.get("claim")
         if action == "task.claim":
             expired = state == "claimed" and claim and claim["lease_until"] <= now
@@ -177,14 +182,24 @@ class TaskStore:
             if state not in {"claimed", "action"}: raise TaskConflict("task is not renewable", task)
             if not lease_seconds or lease_seconds <= 0: raise TaskConflict("positive lease required", task)
             claim["lease_until"] = now + lease_seconds
-        elif action in {"task.checkpoint", "task.action_required", "task.resume", "task.complete", "task.fail"}:
+        elif action in {"task.checkpoint", "task.action_required", "task.resume", "task.submit", "task.fail"}:
             self._owner(task, actor, lease_id)
             if state not in {"claimed", "action"}: raise TaskConflict("task is not owned", task)
             if checkpoint_ref is not None: task["checkpoint_ref"] = checkpoint_ref
             if action == "task.action_required": task["state"] = "action"
             elif action == "task.resume": task["state"] = "claimed"
-            elif action == "task.complete": task["state"], task["result_ref"] = "completed", result_ref
+            elif action == "task.submit":
+                if not result_ref: raise TaskConflict("result ref required", task)
+                task["state"], task["result_ref"], task["claim"] = "submitted", result_ref, None
             elif action == "task.fail": task["state"], task["failure"] = "failed", failure
+        elif action in {"task.accept", "task.reject"}:
+            if state != "submitted": raise TaskConflict("task is not submitted", task)
+            if actor != task["verifier"]: raise TaskConflict("verifier mismatch", task)
+            if action == "task.accept":
+                task["state"] = "completed"
+            else:
+                task["state"], task["result_ref"] = "ready", None
+                task["feedback_ref"] = feedback_ref
         elif action == "task.cancel":
             if state in TERMINAL: raise TaskConflict("task is terminal", task)
             task["state"] = "cancelled"
