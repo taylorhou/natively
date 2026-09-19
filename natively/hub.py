@@ -38,13 +38,19 @@ import tempfile
 import threading
 import time
 import os
+import hashlib
+import re
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from . import crypto, envelope, jcs
+from .tasks import TaskConflict, TaskStore
 
 MAX_BODY = 64 * 1024 * 1024  # 64MB blobs/envelopes cap
 REGISTER_WINDOW_S = 300      # a registration older/newer than this is replayed or misclocked
-POLL_TOKEN_WINDOW_S = 120    # a poll token older/newer than this is refused
+POLL_TOKEN_WINDOW_S = 120
+TASK_TOKEN_WINDOW_S = 120
+_BOARD_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,127}")    # a poll token older/newer than this is refused
 
 
 def fingerprint(node_key_b64: str) -> str:
@@ -146,6 +152,8 @@ class State:
                          else tempfile.mkdtemp(prefix="natively-hub-blobs-"))
         self._private_store = not path  # made by mkdtemp for this hub alone: removed when it closes
         self._blob_dir_ready = False
+        task_path = (path + ".tasks.sqlite") if path else os.path.join(self.blob_dir, "tasks.sqlite")
+        self.tasks = TaskStore(task_path)
         self.prekeys = {}       # node_fp -> bundle
         self.nodes = {}         # node_fp -> {name, agents}
         self.agent_dir = {}     # "name@nodefp" -> {agent_key, card, node_fp}
@@ -569,6 +577,38 @@ def make_server(port: int, state: State):
                 return "poll token expired"
             return None
 
+        def _task_auth(self, method, path, body, board, action):
+            """Authenticate an enrolled agent and its board-scoped capability."""
+            raw = self.headers.get("X-Natively-Agent")
+            if not raw:
+                return None, "agent token required"
+            try:
+                tok = jcs.loads(crypto.b64d(raw))
+            except Exception:
+                return None, "bad agent token"
+            key = tok.get("agent_key") if isinstance(tok, dict) else None
+            bare = _key_b64(key)
+            with st.lock:
+                owner = st.agent_owner.get(bare)
+                card = self._card_for(bare, owner) if owner else None
+            if not card or not envelope.verify_obj(tok, bare):
+                return None, "bad agent token signature"
+            if (tok.get("op") != "task.http" or tok.get("method") != method
+                    or tok.get("path") != path or tok.get("body_sha256") != hashlib.sha256(body).hexdigest()):
+                return None, "agent token does not match request"
+            if not _within(tok.get("ts"), TASK_TOKEN_WINDOW_S):
+                return None, "agent token expired"
+            caps = set(card.get("capabilities") or ())
+            allowed = {"task.%s:%s" % (action, board), "task.*:%s" % board,
+                       "task.admin:%s" % board}
+            if not caps.intersection(allowed):
+                return None, "board capability required"
+            return key, None
+
+        @staticmethod
+        def _board(value):
+            return value if isinstance(value, str) and _BOARD_RE.fullmatch(value) else None
+
         def _card_for(self, agent_key_b64, owner_fp):
             for v in st.agent_dir.values():
                 if v.get("node_fp") == owner_fp and _key_b64(v.get("agent_key")) == agent_key_b64:
@@ -680,6 +720,32 @@ def make_server(port: int, state: State):
                             st.qids[fp] = {e.get("env", {}).get("msg_id") for e in keep}
                             st.save()
                 return self._json(200, {"messages": out, "last_seq": last})
+            parsed = urllib.parse.urlsplit(p)
+            parts = [urllib.parse.unquote(x) for x in parsed.path.split("/") if x]
+            query = urllib.parse.parse_qs(parsed.query)
+            if len(parts) == 3 and parts[:2] == ["v1", "tasks"]:
+                task = st.tasks.get(parts[2])
+                if not task:
+                    return self._json(404, {"error": "unknown task"})
+                actor, err = self._task_auth("GET", p, b"", task["board_id"], "read")
+                if err: return self._json(401 if "token" in err or "signature" in err else 403, {"error": err})
+                return self._json(200, task)
+            if len(parts) == 4 and parts[:2] == ["v1", "taskboards"] and parts[3] in ("tasks", "events"):
+                board = self._board(parts[2])
+                if not board: return self._json(400, {"error": "bad board"})
+                actor, err = self._task_auth("GET", p, b"", board, "read")
+                if err: return self._json(401 if "token" in err or "signature" in err else 403, {"error": err})
+                try: after = int((query.get("after") or [0])[0])
+                except ValueError: return self._json(400, {"error": "bad cursor"})
+                if parts[3] == "events":
+                    try: limit = int((query.get("limit") or [1000])[0])
+                    except ValueError: return self._json(400, {"error": "bad limit"})
+                    events = st.tasks.events(board, after, limit)
+                    return self._json(200, {"events": events, "cursor": events[-1]["seq"] if events else after})
+                states = [x for x in (query.get("state") or [""])[0].split(",") if x]
+                if any(x not in ("ready", "claimed", "action", "submitted", "completed", "failed", "cancelled") for x in states):
+                    return self._json(400, {"error": "bad state"})
+                return self._json(200, st.tasks.list(board, states, after))
             return self._json(404, {"error": "not found"})
 
         def do_PUT(self):
@@ -885,6 +951,48 @@ def make_server(port: int, state: State):
                     for fp in targets:
                         st._cond(fp).notify_all()
                 return self._json(200, {"queued": queued, "deduped": deduped})
+            parsed = urllib.parse.urlsplit(self.path)
+            parts = [urllib.parse.unquote(x) for x in parsed.path.split("/") if x]
+            if len(parts) == 4 and parts[:2] == ["v1", "taskboards"] and parts[3] == "tasks":
+                b = self._body()
+                board = self._board(parts[2])
+                if not board: return self._json(400, {"error": "bad board"})
+                actor, err = self._task_auth("POST", self.path, b or b"", board, "post")
+                if err: return self._json(401 if "token" in err or "signature" in err else 403, {"error": err})
+                try: req = jcs.loads(b)
+                except Exception: return self._json(400, {"error": "bad json"})
+                if (not isinstance(req, dict) or not envelope.safe_id(req.get("task_id"), "tsk")
+                        or not isinstance(req.get("title"), str) or not isinstance(req.get("body_ref"), str)):
+                    return self._json(400, {"error": "task_id, title and body_ref required"})
+                try:
+                    task = st.tasks.post(board, actor, req.get("task_id"), req.get("title"), req.get("body_ref"),
+                        req.get("required_capabilities") or (), req.get("depends_on") or (), req.get("priority", 50),
+                        req.get("extensions") or {}, req.get("idempotency_key"), req.get("verifier"), req.get("acceptance_ref"))
+                    return self._json(201, task)
+                except TaskConflict as e: return self._json(409, {"error": str(e), "task": e.task})
+                except (TypeError, ValueError) as e: return self._json(400, {"error": str(e)})
+            if len(parts) == 4 and parts[:2] == ["v1", "tasks"] and parts[3] == "transitions":
+                b = self._body()
+                task = st.tasks.get(parts[2])
+                if not task: return self._json(404, {"error": "unknown task"})
+                try: req = jcs.loads(b)
+                except Exception: return self._json(400, {"error": "bad json"})
+                action = req.get("action", "")
+                cap = {"task.claim":"claim", "task.renew":"claim", "task.checkpoint":"claim",
+                       "task.action_required":"claim", "task.resume":"claim", "task.submit":"claim",
+                       "task.fail":"claim", "task.accept":"verify", "task.reject":"verify",
+                       "task.cancel":"cancel", "task.extensions":"post"}.get(action)
+                if not cap: return self._json(400, {"error": "unsupported action"})
+                actor, err = self._task_auth("POST", self.path, b or b"", task["board_id"], cap)
+                if err: return self._json(401 if "token" in err or "signature" in err else 403, {"error": err})
+                try:
+                    out = st.tasks.transition(parts[2], req.get("expected_revision"), action, actor,
+                        req.get("idempotency_key"), req.get("capabilities") or (), req.get("lease_id"),
+                        req.get("lease_seconds"), req.get("checkpoint_ref"), req.get("result_ref"),
+                        req.get("failure"), req.get("extensions"), req.get("feedback_ref"))
+                    return self._json(200, out)
+                except TaskConflict as e: return self._json(409, {"error": str(e), "task": e.task})
+                except (TypeError, ValueError) as e: return self._json(400, {"error": str(e)})
             if self.path == "/v1/blob":
                 b = self._body()
                 if b is None:

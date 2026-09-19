@@ -83,6 +83,38 @@ class TaskStore:
         return self._task(self._db().execute(
             "SELECT document FROM tasks WHERE task_id=?", (task_id,)).fetchone())
 
+    def list(self, board_id, states=(), after=0, limit=100):
+        """Return a stable cursor page without exposing another board.
+
+        `after` is the board event cursor, rather than an offset into a
+        mutable task table. A task changed after that cursor appears once at
+        its latest revision. Adapters persist the returned cursor and replay
+        safely after a disconnect.
+        """
+        limit = max(1, min(int(limit), 1000))
+        after = max(0, int(after))
+        states = tuple(sorted(set(states or ())))
+        sql = """SELECT e.seq,t.document FROM task_events e
+                 JOIN tasks t ON t.task_id=e.task_id
+                 WHERE e.board_id=? AND e.seq>?"""
+        args = [board_id, after]
+        if states:
+            sql += " AND t.state IN (%s)" % ",".join("?" for _ in states)
+            args.extend(states)
+        # A task may have several events in one page. Return its current
+        # projection once, ordered by the newest matching event.
+        sql += " ORDER BY e.seq LIMIT ?"
+        args.append(limit * 4)
+        rows = self._db().execute(sql, args).fetchall()
+        latest = {}
+        cursor = after
+        for row in rows:
+            task = json.loads(row["document"])
+            latest[task["task_id"]] = (row["seq"], task)
+            cursor = max(cursor, row["seq"])
+        items = [v[1] for v in sorted(latest.values(), key=lambda x: x[0])]
+        return {"tasks": items[:limit], "cursor": cursor}
+
     def post(self, board_id, actor, task_id, title, body_ref, capabilities=(),
              depends_on=(), priority=50, extensions=None, idempotency_key=None,
              verifier=None, acceptance_ref=None):
