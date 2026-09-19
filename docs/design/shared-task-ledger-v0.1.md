@@ -29,6 +29,7 @@ A task has an immutable `task_id` and revisioned state:
   "required_capabilities": ["bill.extract.v1"],
   "depends_on": [],
   "priority": 50,
+  "extensions": {},
   "state": "claimed",
   "claim": {
     "agent": "ed25519:<agent-key>",
@@ -44,6 +45,8 @@ A task has an immutable `task_id` and revisioned state:
 ```
 
 The hub stores routing metadata and opaque encrypted body/checkpoint/result refs. It must not receive task plaintext unless the posting principal explicitly chooses a public task.
+
+`extensions` is a namespaced map whose unknown keys are preserved byte-for-byte in snapshots/events and ignored by v0.1 coordination. This leaves room for a higher Teale work-market layer to attach bid, price, escrow, settlement, or marketplace-fee references without changing Natively's state machine. Natively never validates balances or settles value; Teale/gateway owns credits and escrow. Extension changes are signed revisioned transitions and cannot rewrite core ownership/state fields. Private boards, with APM bill entry as the first customer path, come before any public marketplace.
 
 States:
 

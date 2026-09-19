@@ -1,0 +1,31 @@
+name: Natively conformance
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: pip install -r requirements.txt pytest
+      - name: Unit and protocol tests
+        run: python -m pytest -q tests --durations=20
+      - name: Real-process conformance journey
+        run: timeout 180 bash tests/itest.sh
+      - name: Ten-minute deterministic soak
+        run: python scripts/soak.py --duration 600 --nodes 5 --rate 4 --restart-hub-every 90 --output soak.json
+      - name: Publish soak evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: natively-soak-${{ github.sha }}
+          path: soak.json
+          if-no-files-found: error
