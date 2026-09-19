@@ -8,6 +8,7 @@ import time
 from . import crypto, envelope, jcs, revocation
 from . import node as nodemod
 from . import hub as hubmod
+from .ledger import Ledger
 
 
 def _home(args):
@@ -198,6 +199,10 @@ def cmd_fetch_blob(args):
 
 
 def cmd_ledger(args):
+    if args.ledger_cmd == "repair":
+        ledger = Ledger(os.path.join(_home(args), "ledger.jsonl"))
+        print(json.dumps(ledger.repair_forks(apply=args.apply), indent=2, sort_keys=True))
+        return
     n = nodemod.Node(_home(args))
     if args.ledger_cmd == "head":
         print(n.ledger.head())
@@ -392,7 +397,7 @@ def main(argv=None):
     p = sub.add_parser("groups"); p.set_defaults(f=cmd_groups)
     p = sub.add_parser("inbox"); p.add_argument("--agent", required=True); p.add_argument("--tail", type=int); p.set_defaults(f=cmd_inbox)
     p = sub.add_parser("fetch-blob"); p.add_argument("--agent", required=True); p.add_argument("--msg-id", required=True); p.add_argument("--out", required=True); p.set_defaults(f=cmd_fetch_blob)
-    p = sub.add_parser("ledger"); p.add_argument("ledger_cmd", choices=["head", "verify", "tail", "peers"]); p.add_argument("-n", type=int, default=10); p.set_defaults(f=cmd_ledger)
+    p = sub.add_parser("ledger"); p.add_argument("ledger_cmd", choices=["head", "verify", "tail", "peers", "repair"]); p.add_argument("-n", type=int, default=10); p.add_argument("--apply", action="store_true", help="apply a verified fork repair; repair is dry-run by default"); p.set_defaults(f=cmd_ledger)
     p = sub.add_parser("grant-delegate"); p.add_argument("--from", dest="frm", required=True, help="local agent holding the parent grant"); p.add_argument("--to", required=True, help="local agent receiving the delegation"); p.add_argument("--parent", required=True); p.add_argument("--scope", required=True); p.add_argument("--statement", required=True); p.add_argument("--max-uses", type=int, default=1); p.add_argument("--windowed", action="store_true", help="the scope entries carry max_uses_per_window; the grant carries no max_uses"); p.add_argument("--ttl", type=int, default=86400); p.set_defaults(f=cmd_grant_delegate)
     p = sub.add_parser("revoke"); p.add_argument("--principal", required=True); p.add_argument("--target", required=True); p.add_argument("--reason"); p.set_defaults(f=cmd_revoke)
     p = sub.add_parser("grant-issue"); p.add_argument("--agent", required=True); p.add_argument("--principal", required=True); p.add_argument("--principal-name", default="principal"); p.add_argument("--scope", required=True); p.add_argument("--statement", required=True); p.add_argument("--max-uses", type=int, default=1); p.add_argument("--windowed", action="store_true", help="the scope entries carry max_uses_per_window; the grant carries no max_uses"); p.add_argument("--ttl", type=int, default=86400); p.add_argument("--revocation-ledger", help="feed URL (file:// or https://) of the principal's tombstones; the node's local feed is always consulted"); p.set_defaults(f=cmd_grant_issue)

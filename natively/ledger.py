@@ -2,8 +2,10 @@
 prose mirror beside every entry. Content hashes, not content.
 """
 import fcntl
+import hashlib
 import json
 import os
+import tempfile
 import time
 from . import jcs
 
@@ -245,6 +247,98 @@ class Ledger:
                 for gid in {grant_id, parent} - {None}:
                     self._by_grant.setdefault(gid, []).append(entry)
         return entry
+
+    def repair_forks(self, apply=False):
+        """Stream-repair self-consistent rows that forked under legacy writers.
+
+        File order is the only durable ordering left after the old append race:
+        every original row and field is retained, while `prev_hash` and the
+        derived `prev_hash_chain` are recomputed from the first mismatch
+        onward. Rows whose own hash is invalid are refused as corruption.
+        Dry-run is the default. Apply archives the exact original beside the
+        ledger and publishes the repaired file with an evidence manifest.
+        """
+        directory = os.path.dirname(os.path.abspath(self.path))
+        stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+        fd, candidate = tempfile.mkstemp(dir=directory, prefix=".ledger-repair-", suffix=".jsonl")
+        original_sha, repaired_sha = hashlib.sha256(), hashlib.sha256()
+        expected, new_prev = "GENESIS", "GENESIS"
+        rows = changed = first = 0
+        first_evidence = None
+        try:
+            with os.fdopen(fd, "wb") as out, open(self.path, "rb") as source:
+                for raw in source:
+                    original_sha.update(raw)
+                    stripped = raw.strip()
+                    if not stripped:
+                        continue
+                    rows += 1
+                    try:
+                        row = json.loads(stripped.decode("utf-8"))
+                        if not isinstance(row, dict):
+                            raise ValueError("row is not an object")
+                        old_hash = row.get("prev_hash_chain")
+                        body = {k: v for k, v in row.items() if k != "prev_hash_chain"}
+                        calculated = jcs.sha256(jcs.canonicalize(body))
+                    except (UnicodeError, ValueError, TypeError, RecursionError) as e:
+                        raise LedgerCorrupt("ledger row %d does not parse: %s" % (rows, e))
+                    if not isinstance(old_hash, str) or calculated != old_hash:
+                        raise LedgerCorrupt("ledger row %d is not internally self-consistent" % rows)
+                    mismatch = row.get("prev_hash") != expected
+                    if mismatch and not first:
+                        first = rows
+                        first_evidence = {"row": rows, "expected_prev_hash": expected,
+                            "observed_prev_hash": row.get("prev_hash"),
+                            "observed_row_hash": old_hash}
+                    if first:
+                        row["prev_hash"] = new_prev
+                        body = {k: v for k, v in row.items() if k != "prev_hash_chain"}
+                        row["prev_hash_chain"] = jcs.sha256(jcs.canonicalize(body))
+                        changed += int(row["prev_hash_chain"] != old_hash or mismatch)
+                    encoded = (json.dumps(row, separators=(",", ":")) + "\n").encode()
+                    out.write(encoded); repaired_sha.update(encoded)
+                    expected = old_hash
+                    new_prev = row["prev_hash_chain"]
+                out.flush(); os.fsync(out.fileno())
+            evidence = {"schema": "natively.ledger-repair.v1", "rows": rows,
+                "first_mismatch": first_evidence, "rows_rehashed": (rows - first + 1) if first else 0,
+                "rows_with_changed_hash": changed, "original_head": expected,
+                "repaired_head": new_prev, "original_sha256": original_sha.hexdigest(),
+                "repaired_sha256": repaired_sha.hexdigest(), "content_policy": "all rows retained in file order"}
+            if not first:
+                os.unlink(candidate)
+                evidence["applied"] = False
+                evidence["status"] = "chain already valid"
+                return evidence
+            if not apply:
+                os.unlink(candidate)
+                evidence["applied"] = False
+                evidence["status"] = "repair available; rerun with --apply"
+                return evidence
+            archive = self.path + ".pre-repair." + stamp
+            manifest = self.path + ".repair." + stamp + ".json"
+            if os.path.exists(archive) or os.path.exists(manifest):
+                raise LedgerCorrupt("repair archive already exists for %s" % stamp)
+            # Original is renamed, never rewritten. Candidate and manifest are
+            # durable before the directory publishes their final names.
+            os.replace(self.path, archive)
+            os.replace(candidate, self.path)
+            evidence.update({"applied": True, "status": "repaired",
+                             "archive": archive, "manifest": manifest})
+            with open(manifest + ".tmp", "w") as f:
+                json.dump(evidence, f, indent=2, sort_keys=True); f.write("\n")
+                f.flush(); os.fsync(f.fileno())
+            os.replace(manifest + ".tmp", manifest)
+            self._fsync_dir(directory)
+            self._head_cache = self._head_stat = self._by_grant = None
+            if not self.verify_chain():
+                raise LedgerCorrupt("repaired ledger failed verification; original is at %s" % archive)
+            return evidence
+        except Exception:
+            try:
+                if os.path.exists(candidate): os.unlink(candidate)
+            finally:
+                raise
 
     def entries(self):
         with open(self.path) as f:

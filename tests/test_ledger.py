@@ -98,3 +98,58 @@ def test_rebuilding_the_index_keeps_the_stat_key(tmp_path):
     finally:
         builtins.open = orig
     assert path not in calls
+
+
+def _forked_ledger(path, shape):
+    from natively import jcs
+    rows, prev = [], "GENESIS"
+    for i in range(5):
+        row = {"ts": "2026-09-19T00:00:0%dZ" % i, "actor": "agent:a", "grant_id": None,
+               "action": "test", "params_hash": jcs.sha256(jcs.canonicalize({"i": i})),
+               "outcome": "ok", "prev_hash": prev}
+        row["prev_hash_chain"] = jcs.sha256(jcs.canonicalize(row))
+        rows.append(row); prev = row["prev_hash_chain"]
+    stray = dict(rows[2], prev_hash="f" * 64, actor="agent:stray")
+    stray["prev_hash_chain"] = jcs.sha256(jcs.canonicalize({k: v for k, v in stray.items() if k != "prev_hash_chain"}))
+    if shape == "interleaved":
+        rows.insert(3, stray)  # next row resumes the original chain (96)
+    else:
+        rows[3] = stray
+        rows[4]["prev_hash"] = stray["prev_hash_chain"]  # later rows chose the fork (air)
+        rows[4]["prev_hash_chain"] = jcs.sha256(jcs.canonicalize({k: v for k, v in rows[4].items() if k != "prev_hash_chain"}))
+    open(path, "w").write("".join(json.dumps(r, separators=(",", ":")) + "\n" for r in rows))
+    return rows
+
+
+@pytest.mark.parametrize("shape", ["interleaved", "fork_wins"])
+def test_repair_splices_legacy_concurrent_append_forks_without_losing_rows(tmp_path, shape):
+    import hashlib
+    path = str(tmp_path / "ledger.jsonl")
+    before = _forked_ledger(path, shape)
+    raw = open(path, "rb").read()
+    ledger = Ledger(path)
+    assert not ledger.verify_chain()
+    dry = ledger.repair_forks()
+    assert dry["first_mismatch"]["row"] == 4 and not dry["applied"]
+    assert open(path, "rb").read() == raw and not list(tmp_path.glob("*.pre-repair.*"))
+    result = ledger.repair_forks(apply=True)
+    archive = result["archive"]
+    assert result["applied"] and result["rows"] == len(before)
+    assert open(archive, "rb").read() == raw
+    assert result["original_sha256"] == hashlib.sha256(raw).hexdigest()
+    after = list(Ledger(path).entries())
+    assert Ledger(path).verify_chain() and len(after) == len(before)
+    # Every content field survives; only the two chain fields may change.
+    strip = lambda r: {k: v for k, v in r.items() if k not in ("prev_hash", "prev_hash_chain")}
+    assert list(map(strip, after)) == list(map(strip, before))
+    assert json.load(open(result["manifest"]))["repaired_head"] == after[-1]["prev_hash_chain"]
+
+
+def test_repair_refuses_an_internally_invalid_row(tmp_path):
+    path = str(tmp_path / "ledger.jsonl")
+    rows = _forked_ledger(path, "interleaved")
+    rows[3]["actor"] = "tampered-after-hash"
+    open(path, "w").write("".join(json.dumps(r) + "\n" for r in rows))
+    with pytest.raises(Exception, match="internally self-consistent"):
+        Ledger(path).repair_forks(apply=True)
+    assert not list(tmp_path.glob("*.pre-repair.*"))
