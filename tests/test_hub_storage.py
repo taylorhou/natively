@@ -403,3 +403,27 @@ def test_the_hubs_handlers_are_joined_before_the_final_flush(tmp_path):
         assert srv.daemon_threads is False  # server_close joins them: no handler outlives State.close
     finally:
         srv.server_close()
+
+
+
+def test_soak_restart_joins_idle_keepalive_handlers(tmp_path):
+    # Regression for CI run 35438183742. The soak harness made handlers
+    # daemonic, so restart opened a second State while an old keep-alive
+    # handler could still publish state.json.tmp. The production server's
+    # handlers must be joinable AND idle sockets must expire promptly.
+    import importlib.util
+    import socket
+    import time
+    spec = importlib.util.spec_from_file_location("natively_soak", os.path.join(
+        os.path.dirname(os.path.dirname(__file__)), "scripts", "soak.py"))
+    soak = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(soak)
+    h = soak.RestartableHub(tmp_path / "state.json", 0)
+    h.start()
+    conn = socket.create_connection(h.server.server_address, timeout=2)
+    conn.sendall(b"GET /v1/healthz HTTP/1.1\r\nHost: x\r\n\r\n")
+    assert b"200 OK" in conn.recv(4096)
+    started = time.monotonic()
+    h.stop()
+    conn.close()
+    assert time.monotonic() - started < 3

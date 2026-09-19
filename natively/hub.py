@@ -514,6 +514,10 @@ def make_server(port: int, state: State):
 
     class H(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
+        # Bound idle keep-alive handlers so server_close can join them before
+        # State.close/restart. Active requests have their own bounded work;
+        # an idle socket must not keep the old State alive indefinitely.
+        timeout = 1.0
 
         def log_message(self, *a):
             pass

@@ -44,7 +44,11 @@ class RestartableHub:
         self.state = hubmod.State(self.path)
         self.state.POLL_WAIT = 0.01
         self.server = hubmod.make_server(self.port, self.state)
-        self.server.daemon_threads = True
+        # Keep make_server's non-daemon handler contract. server_close() must
+        # join every in-flight handler before State.close() and before the
+        # replacement State opens the same state.json path. Overriding this
+        # to True let an old handler and the restarted hub share
+        # state.json.tmp, producing intermittent FileNotFoundError at rename.
         self.thread = threading.Thread(
             target=self.server.serve_forever,
             kwargs={"poll_interval": 0.01},
