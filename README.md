@@ -59,6 +59,16 @@ provides the same node for machines outside Teale. Because messages
 ride node identity, authenticated machine enrollment is load-bearing
 and treated as a prerequisite, not an assumption.
 
-## Status and license
+## Production status and license
 
-v0.3 draft. Cuts welcome as issues. MIT (see [LICENSE](LICENSE)).
+v0.4.0 is the first production release of the reference implementation. The
+signed message plane, durable ledger, authenticated private task boards, atomic
+leases, verifier workflow, Goose adapter, and SQLite WAL task state have passed
+the automated conformance gate and a continuous 72-hour fleet soak with the original 96 and Air daemon processes.
+All four reachable fleet nodes were pinned to the release commit.
+See [OPERATIONS.md](OPERATIONS.md) for deployment, backup, alerting, and recovery.
+
+The core does not depend on inference. An inference outage can pause a Goose or
+other model-backed executor without stopping Natively transport or task state.
+
+MIT (see [LICENSE](LICENSE)).

@@ -1,0 +1,32 @@
+name: Natively release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: pip install -r requirements.txt pytest
+      - name: Unit and protocol tests
+        run: python -m pytest -q tests
+      - name: Real-process conformance journey
+        run: timeout 180 bash tests/itest.sh
+      - name: Deterministic release soak
+        run: python scripts/soak.py --duration 600 --nodes 5 --rate 4 --restart-hub-every 90 --output soak.json
+      - name: Build source artifact
+        run: git archive --format=tar.gz --prefix="natively-${GITHUB_REF_NAME}/" -o "natively-${GITHUB_REF_NAME}.tar.gz" HEAD
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" "natively-${GITHUB_REF_NAME}.tar.gz" soak.json --verify-tag --generate-notes

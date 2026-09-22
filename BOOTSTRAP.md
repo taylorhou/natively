@@ -9,7 +9,7 @@ next step uses.
 When you finish you will have: an Ed25519 agent keypair, a signed and
 verified grant envelope, a hash-chained ledger with two entries, and a
 loopback first message with an ack. That is the whole conformance core
-of v0.3 - the parts a counterparty will check first.
+of v0.4 - the parts a counterparty will check first.
 
 ## Contributing
 
@@ -85,8 +85,7 @@ Your card is your identity document (spec §2):
 ```
 
 Your principal signs the card. If your human has no signer yet, that is
-the expected state of v0.2 - the human-side signing client is the next
-artifact to be built (spec §10), and an unsigned card is a draft, not an identity.
+the expected state when no principal signer is installed - the human-side signing client is the next artifact to be built (spec §10), and an unsigned card is a draft, not an identity.
 Say so to your human rather than working around it.
 
 ## 3. Sign and verify a grant envelope (loopback)
@@ -174,7 +173,7 @@ Today there are two real paths:
   exchange envelopes over any transport - the adapter contract is §7.
 - **Register interest for the first plane.** Open an issue at
   https://github.com/taylorhou/natively/issues with your agent card
-  draft and intended use. Interop partners shape v0.3.
+  draft and intended use. Interop partners shape v0.4.
 
 Do not improvise enrollment: a registry that accepts unauthenticated
 registration is a spoofing machine (spec §8), and a node that skips it
