@@ -1083,6 +1083,12 @@ class Node:
             (stay if fp == to_fp else moved.setdefault(fp, [])).append(k)
         if not moved and not unknown and len(stay) + len(already & set(named)) == len(named):
             return False
+        if isinstance(req.get("env"), dict) and not moved and not unknown:
+            # A prepared envelope is immutable after its first POST. If
+            # no new recipient needs a split, filtered/previously split
+            # members cannot change that envelope or the split set.
+            # Do not rewrite it or append a no-op split on every retry.
+            return False
         for keys in list(moved.values()) + [[k] for k in unknown]:
             self.queue_send(req["from_agent"], keys[0], dict(body, recipients=keys),
                             grant_ids=req.get("grant_ids") or [], control=bool(req.get("control")))
@@ -1493,10 +1499,10 @@ class Node:
         """POST one recipient's files serially over the lane's own keep-alive
         connection (_hub_req is per-thread). Only the network call happens
         on the lane; every state mutation is applied afterwards by the main
-        thread in _flush_apply, in this same order. A control envelope the
-        hub refused room for (429) defers the rest of the shard: its relays
-        must never overtake the key they decrypt under (the sequential
-        pass's held-set, per recipient)."""
+        thread in _flush_apply, in this same order. Any 429 defers the rest
+        of this recipient shard: the first refusal already establishes
+        backpressure, and later files wait for the main-thread recipient
+        backoff. This also keeps relays behind refused control envelopes."""
         out = []
         deferred = False
         for item in items:
@@ -1509,7 +1515,7 @@ class Node:
                 out.append((item, None, False))
             except urllib.error.HTTPError as e:
                 out.append((item, e, False))
-                if e.code == 429 and f.startswith("ctl_"):
+                if e.code == 429:
                     deferred = True
             except Exception as e:
                 out.append((item, e, False))

@@ -44,7 +44,7 @@ def test_a_ctl_429_defers_the_rest_of_its_shard(tmp_path, hub, principal):
     assert len(posts) == 1  # the key was attempted once; the relays never left
 
 
-def test_a_relay_429_does_not_defer_its_shard(tmp_path, hub, principal):
+def test_a_relay_429_defers_its_shard(tmp_path, hub, principal):
     n1 = make_node(tmp_path, "n1", hub.url, principal, {"alpha": ["msg.send"]})
     posts = []
 
@@ -54,8 +54,8 @@ def test_a_relay_429_does_not_defer_its_shard(tmp_path, hub, principal):
     n1._hub_req = full
     item = lambda f: (f, "/unused/" + f, {"to": "ed25519:rcpt"}, {"msg_id": "msg_" + f}, "fp", None)
     res = n1._flush_post_shard([item("out_r1.json"), item("out_r2.json")])
-    assert [d for _, _, d in res] == [False, False]  # per-file backoff only, exactly as the sequential pass
-    assert len(posts) == 2
+    assert [d for _, _, d in res] == [False, True]  # one refusal per recipient shard
+    assert len(posts) == 1
 
 
 def test_a_429_suppresses_the_whole_recipient_not_just_the_file(tmp_path, hub, principal):
@@ -80,7 +80,7 @@ def test_a_429_suppresses_the_whole_recipient_not_just_the_file(tmp_path, hub, p
     n1.queue_send("alpha", beta, {"kind": "text", "text": "one"})
     n1.queue_send("alpha", beta, {"kind": "text", "text": "two"})
     n1.queue_send("alpha", gamma, {"kind": "text", "text": "elsewhere"})
-    n1.step()  # both beta files attempt and 429 (per-file semantics in-pass); gamma lands
+    n1.step()  # one beta file attempts and 429; its shard waits, gamma lands
     assert len(hub.state.queues[n3.fp]) == 1
     rk = beta.split(":", 1)[1]
     assert n1._rcpt_backoff.get(rk, (0.0,))[0] > 0  # the refusal is remembered per recipient
