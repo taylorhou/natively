@@ -37,6 +37,7 @@ import time
 import urllib.request
 
 from . import envelope, jcs
+from .ledger import _open600
 
 
 class RevocationError(Exception):
@@ -267,7 +268,7 @@ class Revocations:
         pending, and raises: the action is refused and the next check
         tries the write again before trusting anything."""
         try:
-            with open(self.lock_path, "w") as lk:
+            with _open600(self.lock_path, "w") as lk:
                 fcntl.flock(lk.fileno(), fcntl.LOCK_EX)
                 try:
                     self._reload()

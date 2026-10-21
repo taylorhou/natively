@@ -18,7 +18,7 @@ import urllib.parse
 import urllib.request
 import urllib.error
 from . import crypto, envelope, jcs
-from .ledger import Ledger, LedgerCorrupt
+from .ledger import Ledger, LedgerCorrupt, _open600
 from .revocation import Revocations, RevocationError, FeedUnavailable
 
 P = 5  # poll interval seconds (spec 4 sizing: ack_deadline 2P+jitter, retries 2P/4P/8P)
@@ -242,7 +242,7 @@ class _GroupFileLock:
 
     def __enter__(self):
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
-        self.fh = open(self.path, "w")
+        self.fh = _open600(self.path, "w")
         fcntl.flock(self.fh.fileno(), fcntl.LOCK_EX)
         return self
 
@@ -295,6 +295,8 @@ class Node:
         # deep backlog that re-attempt churn, not RTT, becomes the drain limiter (air, 2026-09-09: lanes at
         # -42/min net against ~130/min production while ~1/3 of the outbox targeted capped ghost queues).
         self._file_to = {}     # outbox file -> its recipient, learnt when the file is first read
+        self._deferral_logged = {}  # outbox file -> the deferral class its last retry row named (see _ledger_deferral)
+        self._last_dl_sweep = 0.0  # when _sweep_dead_letters last looked at the outbox
         self.spk_sk = bytes.fromhex(open(os.path.join(self.home, "spk.key")).read().strip())
         # Pinned root set: principal.pub (one key per line, the first is the
         # node's own principal) plus principals/<name>.pub, one file per
@@ -349,8 +351,8 @@ class Node:
         """Atomic and durable: temp file, fsync, rename, the directory
         fsynced (a rename the directory has not persisted can come back as
         the old cursor after power loss)."""
-        tmp = self.state_path + ".tmp"
-        with open(tmp, "w") as f:
+        tmp = self.state_path + ".tmp"  # state.json takes this file's mode in the rename: 0600, not the umask's
+        with _open600(tmp, "w") as f:
             json.dump(self.state, f)
             f.flush()
             os.fsync(f.fileno())
@@ -1049,6 +1051,77 @@ class Node:
     # relay, backoff) is exactly what the sequential pass gave globally
     LIVE_WINDOW = 300  # newest files sent first...
     DRAIN_SLICE = 100  # ...then a guaranteed slice of the oldest
+    DEADLETTER_SWEEP_S = 600  # dead letters leave the outbox at most this often...
+    DEADLETTER_GRACE_S = 3600  # ...once they have been dead this long
+
+    def _ledger_deferral(self, f, cls, prose):
+        """The retry row for an outbox file that waits another pass: written
+        when the file starts waiting for a reason (`cls`) and when the
+        reason changes, never once per pass. The flush runs every ~5 s and
+        a waiting file stays up to DEFER_UNKNOWN_TTL (indefinitely under
+        429), so per-pass rows made 32.4M of 96's 36.2M ledger rows by
+        2026-10-21 and every restart re-verifies them. The terminal row
+        (sent, recipient-unknown, failed) is written as before."""
+        if self._deferral_logged.get(f) == cls:
+            return
+        self._deferral_logged[f] = cls
+        self.ledger.append("node:%s" % self.name, None, "msg.send", {"file": f}, "retry", prose)
+
+    def _dead_letter(self, f, path):
+        """A terminal send: the file becomes <file>.err, stamped with the
+        time it died (the sweep ages it from here, not from its queue
+        time), and its deferral bookkeeping goes with it."""
+        os.rename(path, path + ".err")
+        os.utime(path + ".err")
+        self._deferral_logged.pop(f, None)
+
+    def _sweep_dead_letters(self):
+        """Dead letters (outbox/*.err) are never read again, but they piled
+        up beside the live sends - 96 held 66,473 of them and 0 pending
+        sends on 2026-10-21, so outbox size stopped meaning backlog. Once
+        DEADLETTER_GRACE_S old they move to deadletter/ (owner-only, same
+        bytes). They carry plaintext bodies and blob keys, and how long
+        to keep them is the operator's call: they are removed only past
+        config.json `deadletter_keep_days`, when it is set. One pass per
+        DEADLETTER_SWEEP_S; one ledger row per pass that did anything."""
+        now = time.time()
+        if now - self._last_dl_sweep < self.DEADLETTER_SWEEP_S:
+            return
+        self._last_dl_sweep = now
+        ddir = os.path.join(self.home, "deadletter")
+        moved = expired = 0
+        try:
+            for f in sorted(os.listdir(self.outbox_dir)):
+                src = os.path.join(self.outbox_dir, f)
+                if not f.endswith(".err") or now - os.stat(src).st_mtime < self.DEADLETTER_GRACE_S:
+                    continue
+                if not moved:
+                    os.makedirs(ddir, mode=0o700, exist_ok=True)
+                    os.chmod(ddir, 0o700)
+                os.rename(src, os.path.join(ddir, f))
+                moved += 1
+            keep = self.cfg.get("deadletter_keep_days")
+            if (isinstance(keep, (int, float)) and not isinstance(keep, bool) and keep > 0
+                    and os.path.isdir(ddir)):
+                for f in sorted(os.listdir(ddir)):
+                    p = os.path.join(ddir, f)
+                    if f.endswith(".err") and now - os.stat(p).st_mtime > keep * 86400:
+                        os.unlink(p)
+                        expired += 1
+            if moved or expired:
+                _fsync_dir(self.outbox_dir)
+                _fsync_dir(ddir)
+        except OSError as e:
+            # one bad pass is ledgered and retried next sweep: dead letters
+            # are housekeeping, never a reason to stop flushing or polling
+            self.ledger.append("node:%s" % self.name, None, "outbox.deadletter",
+                               {"moved": moved, "expired": expired}, _oclass(e), "dead-letter sweep stopped: %s" % e)
+            return
+        if moved or expired:
+            self.ledger.append("node:%s" % self.name, None, "outbox.deadletter",
+                               {"moved": moved, "expired": expired}, "swept",
+                               "%d dead letter(s) moved to deadletter/, %d past deadletter_keep_days removed"
+                               % (moved, expired))
 
     def _split_relay(self, f, path, req, to_fp) -> bool:
         """A group_relay naming several recipients was built for one member
@@ -1082,6 +1155,12 @@ class Node:
                 continue  # its card no longer verifies: it is dropped from the fan-out, as group_send would
             (stay if fp == to_fp else moved.setdefault(fp, [])).append(k)
         if not moved and not unknown and len(stay) + len(already & set(named)) == len(named):
+            return False
+        if isinstance(req.get("env"), dict) and not moved and not unknown:
+            # A prepared envelope is immutable after its first POST. If
+            # no new recipient needs a split, filtered/previously split
+            # members cannot change that envelope or the split set.
+            # Do not rewrite it or append a no-op split on every retry.
             return False
         for keys in list(moved.values()) + [[k] for k in unknown]:
             self.queue_send(req["from_agent"], keys[0], dict(body, recipients=keys),
@@ -1230,6 +1309,7 @@ class Node:
         present = set(files)
         self._backoff = {f: v for f, v in self._backoff.items() if f in present}
         self._file_to = {f: v for f, v in self._file_to.items() if f in present}
+        self._deferral_logged = {f: v for f, v in self._deferral_logged.items() if f in present}
         held_to = set()
         for f in files:
             if f.startswith("ctl_") and self._backoff.get(f, (0.0, 0.0))[0] > now:
@@ -1298,7 +1378,7 @@ class Node:
                     # re-resolving - a dead-fanout backlog drains in one pass.
                     self.ledger.append("node:%s" % self.name, None, "msg.send", {"file": f},
                                        "error:Identity", "send failed: recipient identity: %s (same-pass verdict)" % dead[req["to"]])
-                    os.rename(path, path + ".err")
+                    self._dead_letter(f, path)
                     outcomes += 1
                     continue
                 if req["from_agent"] not in self._last_registered:
@@ -1412,8 +1492,7 @@ class Node:
                         _w600_replace(path, json.dumps(req).encode())
                     if f.startswith("ctl_"):
                         held_to.add(_bare_key(req.get("to")))  # from now on in this pass its relays wait behind it too
-                    self.ledger.append("node:%s" % self.name, None, "msg.send", {"file": f},
-                                       "retry", "send deferred %.0fs: %s" % (delay, e))
+                    self._ledger_deferral(f, "backoff", "send deferred %.0fs: %s" % (delay, e))
                     continue
                 if transient and isinstance(e, IdentityUnknown):
                     # Recipient not in the directory: retryable while it
@@ -1426,27 +1505,24 @@ class Node:
                     if first is None:
                         ds[f] = time.time()
                         dirty = True
-                        self.ledger.append("node:%s" % self.name, None, "msg.send", {"file": f},
-                                           "retry", "send deferred: %s" % e)
+                        self._ledger_deferral(f, "unknown", "send deferred: %s" % e)
                     elif time.time() - first > DEFER_UNKNOWN_TTL:
                         ds.pop(f, None)
                         dirty = True
                         self.ledger.append("agent:%s" % req["from_agent"], None, "msg.send",
                                            {"file": f, "to": req.get("to")}, "recipient-unknown",
                                            "terminal: recipient not in the directory for >%ds" % DEFER_UNKNOWN_TTL)
-                        os.rename(path, path + ".err")
+                        self._dead_letter(f, path)
                         outcomes += 1
                     else:
-                        self.ledger.append("node:%s" % self.name, None, "msg.send", {"file": f},
-                                           "retry", "send deferred: %s" % e)
+                        self._ledger_deferral(f, "unknown", "send deferred: %s" % e)
                 elif transient:
                     # hub down / network blip: leave in outbox, retry next pass
-                    self.ledger.append("node:%s" % self.name, None, "msg.send", {"file": f},
-                                       "retry", "send deferred: %s" % e)
+                    self._ledger_deferral(f, "transient", "send deferred: %s" % e)
                 else:
                     self.ledger.append("node:%s" % self.name, None, "msg.send", {"file": f},
                                        _oclass(e), "send failed: %s" % e)
-                    os.rename(path, path + ".err")
+                    self._dead_letter(f, path)
                     outcomes += 1
         if shards:
             # Send phase: lanes POST their shards concurrently. A lane
@@ -1493,10 +1569,10 @@ class Node:
         """POST one recipient's files serially over the lane's own keep-alive
         connection (_hub_req is per-thread). Only the network call happens
         on the lane; every state mutation is applied afterwards by the main
-        thread in _flush_apply, in this same order. A control envelope the
-        hub refused room for (429) defers the rest of the shard: its relays
-        must never overtake the key they decrypt under (the sequential
-        pass's held-set, per recipient)."""
+        thread in _flush_apply, in this same order. Any 429 defers the rest
+        of this recipient shard: the first refusal already establishes
+        backpressure, and later files wait for the main-thread recipient
+        backoff. This also keeps relays behind refused control envelopes."""
         out = []
         deferred = False
         for item in items:
@@ -1509,7 +1585,7 @@ class Node:
                 out.append((item, None, False))
             except urllib.error.HTTPError as e:
                 out.append((item, e, False))
-                if e.code == 429 and f.startswith("ctl_"):
+                if e.code == 429:
                     deferred = True
             except Exception as e:
                 out.append((item, e, False))
@@ -1590,8 +1666,7 @@ class Node:
                     _w600_replace(path, json.dumps(req).encode())
                 # a ctl 429 already deferred the rest of its shard on the
                 # lane - the sequential pass's held-set, per recipient.
-                self.ledger.append("node:%s" % self.name, None, "msg.send", {"file": f},
-                                   "retry", "send deferred %.0fs: %s" % (delay, e))
+                self._ledger_deferral(f, "backoff", "send deferred %.0fs: %s" % (delay, e))
                 return outcomes, dirty
             if transient and isinstance(e, IdentityUnknown):
                 # Recipient not in the directory: retryable while it may
@@ -1603,27 +1678,24 @@ class Node:
                 if first is None:
                     ds[f] = time.time()
                     dirty = True
-                    self.ledger.append("node:%s" % self.name, None, "msg.send", {"file": f},
-                                       "retry", "send deferred: %s" % e)
+                    self._ledger_deferral(f, "unknown", "send deferred: %s" % e)
                 elif time.time() - first > DEFER_UNKNOWN_TTL:
                     ds.pop(f, None)
                     dirty = True
                     self.ledger.append("agent:%s" % req["from_agent"], None, "msg.send",
                                        {"file": f, "to": req.get("to")}, "recipient-unknown",
                                        "terminal: recipient not in the directory for >%ds" % DEFER_UNKNOWN_TTL)
-                    os.rename(path, path + ".err")
+                    self._dead_letter(f, path)
                     outcomes += 1
                 else:
-                    self.ledger.append("node:%s" % self.name, None, "msg.send", {"file": f},
-                                       "retry", "send deferred: %s" % e)
+                    self._ledger_deferral(f, "unknown", "send deferred: %s" % e)
             elif transient:
                 # hub down / network blip: leave in outbox, retry next pass
-                self.ledger.append("node:%s" % self.name, None, "msg.send", {"file": f},
-                                   "retry", "send deferred: %s" % e)
+                self._ledger_deferral(f, "transient", "send deferred: %s" % e)
             else:
                 self.ledger.append("node:%s" % self.name, None, "msg.send", {"file": f},
                                    _oclass(e), "send failed: %s" % e)
-                os.rename(path, path + ".err")
+                self._dead_letter(f, path)
                 outcomes += 1
         return outcomes, dirty
 
@@ -2527,7 +2599,7 @@ class Node:
             raise LedgerCorrupt("ledger chain does not verify: %s" % self.ledger.path)
         # exclusive lock: two daemons on one home diverge session state
         import fcntl
-        self._lockfd = open(os.path.join(self.home, "node.lock"), "w")
+        self._lockfd = _open600(os.path.join(self.home, "node.lock"), "w")
         try:
             fcntl.flock(self._lockfd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
@@ -2564,6 +2636,7 @@ class Node:
             return  # never registered with this hub yet: peers would refuse us, and the poll would 401
         self._retry_pending_group_keys()
         self._flush_outbox()
+        self._sweep_dead_letters()
         try:
             after = self.state["last_seq"]
             _, b = self._hub_req("GET", "/v1/poll/%s?after=%d" % (self.fp, after),
@@ -2642,6 +2715,7 @@ class Node:
 
 def init_node(home, name, hub_url, principal_pub_b64):
     os.makedirs(home, exist_ok=True)
+    os.chmod(home, 0o700)  # keys, sessions and inboxes: owner-only even when the home already existed
     _w600(os.path.join(home, "node.key"), crypto.gen_signing_key().hex().encode())
     _w600(os.path.join(home, "spk.key"), crypto.x_gen().hex().encode())
     _w600(os.path.join(home, "principal.pub"), principal_pub_b64.encode())
