@@ -63,6 +63,35 @@ the hub directory, old inbox entries remain readable, the outbox drains, and
 `ledger verify` still passes. Roll back code only; do not roll back node state
 unless recovering a whole atomic backup.
 
+### Sealing the ledger
+
+A node verifies its live ledger row by row at every start, so startup time
+grows with the file. Seal it (SPEC 5.1) at a planned restart once the live
+segment passes about 1 GB or startup verification takes more than 60 seconds:
+
+```sh
+launchctl bootout gui/$(id -u)/com.teale.natively      # or stop the service
+~/natively/.venv/bin/python -m natively --home ~/.natively ledger seal          # dry run
+~/natively/.venv/bin/python -m natively --home ~/.natively ledger seal --apply
+~/natively/.venv/bin/python -m natively --home ~/.natively ledger verify
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.teale.natively.plist
+```
+
+The seal refuses to run while a daemon holds `node.lock`, verifies every live
+row before it seals, and copies nothing: the live file is renamed (a hard link,
+then an atomic replace) and a new one starts with a `ledger.checkpoint` row.
+`--jobs` sets how many processes verify rows. If a seal is interrupted, run
+`ledger seal --apply` again before starting the daemon; it redoes or finishes
+the interrupted seal. Never edit, move or delete a sealed segment, its prose,
+manifest or grant sidecar; startup refuses a ledger whose sealed bytes do not
+match.
+
+`ledger verify` checks each sealed segment by one sha256 and the live rows by
+hash. `ledger verify --full` re-hashes every row of every segment and the
+sidecars and prose mirrors. It can run beside the daemon, and it takes minutes
+on a multi-GB segment, so run it after each seal and periodically, not on
+every start.
+
 ## Task boards
 
 Task routes authenticate agent signatures and board-scoped capabilities. Bodies,

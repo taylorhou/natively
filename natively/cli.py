@@ -198,20 +198,50 @@ def cmd_fetch_blob(args):
     print("wrote %d bytes to %s (sha256 verified)" % (len(raw), args.out))
 
 
+def _ledger_seal(args):
+    """Seal the live ledger as the next segment (spec 5.1). Only at a
+    planned restart: refused while a daemon holds the home's node.lock,
+    which this holds until the seal is done so none can start mid-seal."""
+    import fcntl
+    from .ledger import LedgerCorrupt
+    home = _home(args)
+    lockf = open(os.path.join(home, "node.lock"), "a")
+    try:
+        fcntl.flock(lockf.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        lockf.close()
+        raise SystemExit("a natively node holds %s/node.lock - stop the daemon before sealing" % home)
+    try:
+        name = json.load(open(os.path.join(home, "config.json")))["name"]
+        ledger = Ledger(os.path.join(home, "ledger.jsonl"))
+        try:
+            res = ledger.seal(apply=args.apply, actor="node:%s" % name, jobs=args.jobs)
+        except LedgerCorrupt as e:
+            raise SystemExit("not sealed: %s" % e)
+    finally:
+        fcntl.flock(lockf.fileno(), fcntl.LOCK_UN)
+        lockf.close()
+    print(json.dumps(res, indent=2, sort_keys=True))
+
+
 def cmd_ledger(args):
     if args.ledger_cmd == "repair":
         ledger = Ledger(os.path.join(_home(args), "ledger.jsonl"))
         print(json.dumps(ledger.repair_forks(apply=args.apply), indent=2, sort_keys=True))
         return
+    if args.ledger_cmd == "seal":
+        return _ledger_seal(args)
     n = nodemod.Node(_home(args))
     if args.ledger_cmd == "head":
         print(n.ledger.head())
     elif args.ledger_cmd == "verify":
-        ok = n.ledger.verify_chain()
-        print("chain ok" if ok else "CHAIN BROKEN")
-        sys.exit(0 if ok else 1)
+        rep = n.ledger.verify(full=args.full, jobs=args.jobs if args.full else 1)
+        if args.full:
+            print(json.dumps(rep, indent=2, sort_keys=True))
+        print("chain ok" if rep["ok"] else "CHAIN BROKEN: %s" % rep["error"])
+        sys.exit(0 if rep["ok"] else 1)
     elif args.ledger_cmd == "tail":
-        for e in list(n.ledger.entries())[-args.n:]:
+        for e in n.ledger.tail(args.n):
             print(json.dumps(e))
     elif args.ledger_cmd == "peers":
         # the ledger heads peers declared in their acks, as recorded - the
@@ -397,7 +427,7 @@ def main(argv=None):
     p = sub.add_parser("groups"); p.set_defaults(f=cmd_groups)
     p = sub.add_parser("inbox"); p.add_argument("--agent", required=True); p.add_argument("--tail", type=int); p.set_defaults(f=cmd_inbox)
     p = sub.add_parser("fetch-blob"); p.add_argument("--agent", required=True); p.add_argument("--msg-id", required=True); p.add_argument("--out", required=True); p.set_defaults(f=cmd_fetch_blob)
-    p = sub.add_parser("ledger"); p.add_argument("ledger_cmd", choices=["head", "verify", "tail", "peers", "repair"]); p.add_argument("-n", type=int, default=10); p.add_argument("--apply", action="store_true", help="apply a verified fork repair; repair is dry-run by default"); p.set_defaults(f=cmd_ledger)
+    p = sub.add_parser("ledger"); p.add_argument("ledger_cmd", choices=["head", "verify", "tail", "peers", "repair", "seal"]); p.add_argument("-n", type=int, default=10); p.add_argument("--apply", action="store_true", help="apply a verified fork repair or a seal; both are dry-run by default"); p.add_argument("--full", action="store_true", help="verify: every row of every sealed segment, not one sha256 each"); p.add_argument("--jobs", type=int, default=max(1, min(8, (os.cpu_count() or 2) // 2)), help="processes for verify --full and seal"); p.set_defaults(f=cmd_ledger)
     p = sub.add_parser("grant-delegate"); p.add_argument("--from", dest="frm", required=True, help="local agent holding the parent grant"); p.add_argument("--to", required=True, help="local agent receiving the delegation"); p.add_argument("--parent", required=True); p.add_argument("--scope", required=True); p.add_argument("--statement", required=True); p.add_argument("--max-uses", type=int, default=1); p.add_argument("--windowed", action="store_true", help="the scope entries carry max_uses_per_window; the grant carries no max_uses"); p.add_argument("--ttl", type=int, default=86400); p.set_defaults(f=cmd_grant_delegate)
     p = sub.add_parser("revoke"); p.add_argument("--principal", required=True); p.add_argument("--target", required=True); p.add_argument("--reason"); p.set_defaults(f=cmd_revoke)
     p = sub.add_parser("grant-issue"); p.add_argument("--agent", required=True); p.add_argument("--principal", required=True); p.add_argument("--principal-name", default="principal"); p.add_argument("--scope", required=True); p.add_argument("--statement", required=True); p.add_argument("--max-uses", type=int, default=1); p.add_argument("--windowed", action="store_true", help="the scope entries carry max_uses_per_window; the grant carries no max_uses"); p.add_argument("--ttl", type=int, default=86400); p.add_argument("--revocation-ledger", help="feed URL (file:// or https://) of the principal's tombstones; the node's local feed is always consulted"); p.set_defaults(f=cmd_grant_issue)
