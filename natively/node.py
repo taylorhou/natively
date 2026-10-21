@@ -18,7 +18,7 @@ import urllib.parse
 import urllib.request
 import urllib.error
 from . import crypto, envelope, jcs
-from .ledger import Ledger, LedgerCorrupt
+from .ledger import Ledger, LedgerCorrupt, _open600
 from .revocation import Revocations, RevocationError, FeedUnavailable
 
 P = 5  # poll interval seconds (spec 4 sizing: ack_deadline 2P+jitter, retries 2P/4P/8P)
@@ -242,7 +242,7 @@ class _GroupFileLock:
 
     def __enter__(self):
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
-        self.fh = open(self.path, "w")
+        self.fh = _open600(self.path, "w")
         fcntl.flock(self.fh.fileno(), fcntl.LOCK_EX)
         return self
 
@@ -351,8 +351,8 @@ class Node:
         """Atomic and durable: temp file, fsync, rename, the directory
         fsynced (a rename the directory has not persisted can come back as
         the old cursor after power loss)."""
-        tmp = self.state_path + ".tmp"
-        with open(tmp, "w") as f:
+        tmp = self.state_path + ".tmp"  # state.json takes this file's mode in the rename: 0600, not the umask's
+        with _open600(tmp, "w") as f:
             json.dump(self.state, f)
             f.flush()
             os.fsync(f.fileno())
@@ -2599,7 +2599,7 @@ class Node:
             raise LedgerCorrupt("ledger chain does not verify: %s" % self.ledger.path)
         # exclusive lock: two daemons on one home diverge session state
         import fcntl
-        self._lockfd = open(os.path.join(self.home, "node.lock"), "w")
+        self._lockfd = _open600(os.path.join(self.home, "node.lock"), "w")
         try:
             fcntl.flock(self._lockfd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
@@ -2715,6 +2715,7 @@ class Node:
 
 def init_node(home, name, hub_url, principal_pub_b64):
     os.makedirs(home, exist_ok=True)
+    os.chmod(home, 0o700)  # keys, sessions and inboxes: owner-only even when the home already existed
     _w600(os.path.join(home, "node.key"), crypto.gen_signing_key().hex().encode())
     _w600(os.path.join(home, "spk.key"), crypto.x_gen().hex().encode())
     _w600(os.path.join(home, "principal.pub"), principal_pub_b64.encode())

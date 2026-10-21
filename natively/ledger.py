@@ -10,6 +10,15 @@ import time
 from . import jcs
 
 
+def _open600(path, mode):
+    """open(path, mode) for a file the node may be the one to create: a new
+    file is owner-only whatever the process umask (96's state, prose mirror
+    and locks came back 0644 under the default 022 on 2026-10-21; the home
+    holds keys). A file that already exists keeps its mode."""
+    flags = os.O_WRONLY | os.O_CREAT | (os.O_APPEND if "a" in mode else os.O_TRUNC)
+    return os.fdopen(os.open(path, flags, 0o600), mode)
+
+
 class LedgerCorrupt(Exception):
     """A row that is not the last one does not parse, or the chain does not
     verify: the ledger is not something to build on. Only a torn LAST line
@@ -23,7 +32,7 @@ class Ledger:
         self.torn_path = path + ".torn"
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         if not os.path.exists(path):
-            open(path, "w").close()
+            _open600(path, "w").close()
             self._fsync_dir(os.path.dirname(os.path.abspath(path)))  # the new file is linked durably: a first append never vanishes with it
         self._head_cache = None
         self._head_stat = None
@@ -38,7 +47,7 @@ class Ledger:
             self.ledger = ledger
 
         def __enter__(self):
-            self.f = open(self.ledger.path + ".lock", "w")
+            self.f = _open600(self.ledger.path + ".lock", "w")
             fcntl.flock(self.f.fileno(), fcntl.LOCK_EX)
             return self
 
@@ -115,10 +124,10 @@ class Ledger:
                 f.write(b"\n")
                 f.flush()
                 os.fsync(f.fileno())
-            with open(self.mirror_path, "a") as m:
+            with _open600(self.mirror_path, "a") as m:
                 m.write("[%s] node: ledger.torn-tail -> delimiter restored (whole row)\n" % stamp)
             return
-        with open(self.torn_path, "ab") as t:
+        with _open600(self.torn_path, "ab") as t:
             t.write(("# torn tail found %s (%d bytes)\n" % (stamp, len(fragment))).encode())
             t.write(fragment + b"\n")
             t.flush()
@@ -129,7 +138,7 @@ class Ledger:
             f.truncate(f.tell() - len(fragment))
             f.flush()
             os.fsync(f.fileno())
-        with open(self.mirror_path, "a") as m:
+        with _open600(self.mirror_path, "a") as m:
             m.write("[%s] node: ledger.torn-tail -> recovered (%d bytes moved to %s)\n"
                     % (stamp, len(fragment), os.path.basename(self.torn_path)))
         self._head_cache = None
@@ -236,7 +245,7 @@ class Ledger:
                     f.write(json.dumps(entry, separators=(",", ":")) + "\n")
                     f.flush()
                     os.fsync(f.fileno())
-                with open(self.mirror_path, "a") as f:
+                with _open600(self.mirror_path, "a") as f:
                     # each prose line carries the first 12 hex of its row's
                     # entry hash, so prose and rows pair up after a torn write
                     f.write("%s [%s] %s: %s -> %s (grant=%s)\n" % (chain[:12], entry["ts"], actor, action, outcome, grant_id or "-"))
