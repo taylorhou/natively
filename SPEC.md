@@ -238,6 +238,43 @@ Append-only JSONL, one line per action taken against a grant:
   verify hashes; principals read prose. Both are kept, because each
   audience trusts a different one.
 
+### 5.1 Segments and checkpoints
+
+A long-lived ledger can be **sealed** into segments, so a node's startup
+verification does not grow with its lifetime row count. The invariant is
+unchanged: **no row is ever removed or rewritten; a seal is a rename plus a
+checkpoint row.**
+
+- **Seal.** With the node stopped, `ledger.jsonl` is renamed to
+  `ledger.NNNNNN.jsonl` (the next free six-digit number, starting at
+  `000001`) and set read-only (0400); its prose mirror becomes
+  `ledger.NNNNNN.jsonl.prose`. Beside them the seal writes
+  `ledger.NNNNNN.manifest.json` (`segment`, `rows`, `bytes`, `sha256` of the
+  file bytes, `first_ts`, `last_ts`, `first_prev_hash`, `head` - the last
+  row's `prev_hash_chain` - and the prose file's `bytes` and `sha256`) and
+  `ledger.NNNNNN.grants.jsonl`, the segment's grant-scoped rows verbatim, so
+  per-grant budgets counted back from the chain still count them.
+- **Checkpoint.** The new `ledger.jsonl` starts with one row
+  `{"actor": "node:<name>", "grant_id": null, "action": "ledger.checkpoint",
+  "params": {"segment", "rows", "sha256", "head", "grant_rows",
+  "grants_sha256"}, "params_hash", "outcome": "sealed", "prev_hash": head}`
+  and the usual `prev_hash_chain`. Its `prev_hash` is the sealed head, not
+  `GENESIS`: the chain is continuous across the seal. Its params are in the
+  clear (they are hashes and counts) and `params_hash` is their hash as on
+  every row. Only a seal writes this action, and only as a segment's first
+  row. The live file keeps its name, so a card's `ledger_url` stays valid.
+- **Verification.** When the live file's first row is a checkpoint, the
+  expected previous hash is its `params.head`, and the segment it names is
+  verified by one streaming sha256 of the file against the checkpoint and
+  the manifest (seconds), not row by row. A sealed segment whose first row
+  is itself a checkpoint is walked back the same way, to a segment that
+  starts at `GENESIS`; segment numbers strictly descend. A full
+  verification re-hashes every row of every segment, oldest first, across
+  each checkpoint, and rebuilds each grant sidecar and prose hash.
+- **Peers.** `ledger_head` in acks is the live head; it is unchanged by
+  a seal, since the checkpoint row becomes the new head only by chaining
+  onto the old one.
+
 ## 6. Revocation and failure
 
 - Revocation is a **per-principal signed append-only feed** of
